@@ -65,3 +65,48 @@ Performance will be compared against:
 - **Open-set and low-abundance tests:** for robustness
 
 Uncertainty may be estimated using bootstrap resampling over test contigs.
+
+---
+
+## Notebook -> CLI pipeline
+
+The exploratory processing in `amr_eda.ipynb` has been distilled into a small
+Python package under `hyper_amr/` with an accompanying CLI. This makes it
+easier to process multiple genomes, train the hyperbolic model, and regenerate
+plots without re-running notebook cells.
+
+### Installation
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Command overview
+
+```bash
+python -m hyper_amr.cli download --urls https://.../genome.fasta --output data/raw
+python -m hyper_amr.cli run-amrfinder --fasta data/raw/genome.fasta --output data/amrfinder
+python -m hyper_amr.cli prepare --tsvs data/amrfinder/genome.amrfinder.tsv \
+    --fastas data/raw/genome.fasta --output data/artifacts
+python -m hyper_amr.cli train --artifacts data/artifacts --fastas data/raw/genome.fasta \
+    --epochs 5 --k 5 --buckets 4096 --class-weights --hash-threads 4 --loader-workers 4
+python -m hyper_amr.cli plot --artifacts data/artifacts
+```
+
+Key steps align with the notebook:
+- **download**: optional helper to fetch FASTA genomes from URLs.
+- **run-amrfinder**: execute AMRFinderPlus per FASTA (plus DB supported).
+- **prepare**: build contig-level AMR labels, attach sequences, and store
+  `contig_amr_labels.parquet` + `amr_class_list.json` artifacts.
+- **train**: hash sequences into k-mer buckets, configure hyperbolic geometry
+  in pure PyTorch, and train/evaluate the joint sequence–AMR model. Optional
+  taxonomy embeddings can be toggled with `--use-taxonomy`. Feature hashing and
+  PyTorch DataLoader construction now support multi-threading via
+  `--hash-threads` and `--loader-workers`.
+- **plot**: generate AMR class frequency and precision–recall plots from saved
+  predictions (`predictions.npz`).
+
+The modules under `hyper_amr/` expose the same functionality for scripted use
+without the CLI.

@@ -1,0 +1,319 @@
+"""Hyperbolic AMR model components lifted from the exploratory notebook."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, Optional
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+
+# --------------------------- Geometry helpers ---------------------------
+
+def project_to_ball(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    norm = torch.norm(x, dim=-1, keepdim=True)
+    max_norm = 1.0 - eps
+    scale = torch.clamp(max_norm / norm, max=1.0)
+    return x * scale
+
+
+def exp_map_zero(v: torch.Tensor, c: float = 1.0, eps: float = 1e-5) -> torch.Tensor:
+    norm = torch.norm(v, dim=-1, keepdim=True).clamp(min=eps)
+    factor = torch.tanh(torch.sqrt(c) * norm) / (torch.sqrt(c) * norm)
+    return project_to_ball(v * factor)
+
+
+def mobius_add(x: torch.Tensor, y: torch.Tensor, c: float = 1.0, eps: float = 1e-5) -> torch.Tensor:
+    xy = torch.sum(x * y, dim=-1, keepdim=True)
+    x2 = torch.sum(x * x, dim=-1, keepdim=True)
+    y2 = torch.sum(y * y, dim=-1, keepdim=True)
+    num = (1 + 2 * c * xy + c * y2) * x + (1 - c * x2) * y
+    denom = 1 + 2 * c * xy + c * c * x2 * y2
+    return project_to_ball(num / denom.clamp(min=eps))
+
+
+def poincare_distance(x: torch.Tensor, y: torch.Tensor, c: float = 1.0, eps: float = 1e-5) -> torch.Tensor:
+    # https://arxiv.org/abs/1705.08039
+    x2 = torch.sum(x * x, dim=-1, keepdim=True)
+    y2 = torch.sum(y * y, dim=-1, keepdim=True)
+    xy = torch.sum((x - y) * (x - y), dim=-1, keepdim=True)
+    num = 2 * torch.sqrt(c) * torch.sqrt(xy)
+    denom = (1 - c * x2).clamp(min=eps) * (1 - c * y2).clamp(min=eps)
+    return torch.acosh(1 + num / denom).squeeze(-1)
+
+
+def info_nce_hyper(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
+    """Contrastive alignment using hyperbolic distance as similarity."""
+
+    B = z1.size(0)
+    d = poincare_distance(z1.unsqueeze(1), z2.unsqueeze(0))  # (B,B)
+    logits = -d / temperature
+    labels = torch.arange(B, device=z1.device)
+    return nn.CrossEntropyLoss()(logits, labels)
+
+
+def stacked_entailment_radial(z_parent: torch.Tensor, z_child: torch.Tensor, margin: float = 0.05) -> torch.Tensor:
+    """Encourage child embeddings to sit farther from the origin than parents."""
+
+    r_par = torch.norm(z_parent, dim=-1)
+    r_child = torch.norm(z_child, dim=-1)
+    return torch.relu(margin + r_par - r_child).mean()
+
+
+def bce_with_pos_weight(logits: torch.Tensor, targets: torch.Tensor, pos_weight: Optional[torch.Tensor]) -> torch.Tensor:
+    return nn.functional.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+
+
+# ------------------------------- Dataset --------------------------------
+
+class ContigDataset(Dataset):
+    def __init__(self, X: np.ndarray, Y: np.ndarray, T: Optional[np.ndarray] = None):
+        self.X = torch.as_tensor(X, dtype=torch.float32)
+        self.Y = torch.as_tensor(Y, dtype=torch.float32)
+        if T is None:
+            T = np.zeros(len(X), dtype=np.int64)
+        self.T = torch.as_tensor(T, dtype=torch.long)
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return self.X.shape[0]
+
+    def __getitem__(self, i: int):  # pragma: no cover - trivial
+        return self.X[i], self.Y[i], self.T[i]
+
+
+# ------------------------------- Model ----------------------------------
+
+@dataclass
+class ModelConfig:
+    seq_dim: int
+    amr_classes: int
+    taxonomy_size: int = 0
+    hidden: int = 512
+    embed_dim: int = 128
+    use_taxonomy: bool = False
+
+
+class HyperAMR(nn.Module):
+    """Lightweight hyperbolic AMR model suitable for CLI training."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.seq_encoder = nn.Sequential(
+            nn.Linear(cfg.seq_dim, cfg.hidden),
+            nn.ReLU(),
+            nn.Linear(cfg.hidden, cfg.embed_dim),
+        )
+        self.amr_encoder = nn.Sequential(
+            nn.Linear(cfg.amr_classes, cfg.hidden),
+            nn.ReLU(),
+            nn.Linear(cfg.hidden, cfg.embed_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(cfg.embed_dim, cfg.hidden),
+            nn.ReLU(),
+            nn.Linear(cfg.hidden, cfg.amr_classes),
+        )
+
+        self.use_taxonomy = cfg.use_taxonomy and cfg.taxonomy_size > 0
+        if self.use_taxonomy:
+            self.taxon_embed = nn.Embedding(cfg.taxonomy_size, cfg.embed_dim)
+        else:
+            self.taxon_embed = None
+
+    def forward(self, seq_feats: torch.Tensor, amr_targets: torch.Tensor, tax_idx: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        z_seq_euc = self.seq_encoder(seq_feats)
+        z_amr_euc = self.amr_encoder(amr_targets)
+
+        z_seq = project_to_ball(exp_map_zero(z_seq_euc))
+        z_amr = project_to_ball(exp_map_zero(z_amr_euc))
+
+        amr_logits = self.decoder(z_seq)
+        out = {"z_seq": z_seq, "z_amr": z_amr, "amr_logits": amr_logits}
+
+        if self.use_taxonomy and tax_idx is not None and self.taxon_embed is not None:
+            tax_vec = self.taxon_embed(tax_idx)
+            out["z_tax"] = project_to_ball(exp_map_zero(tax_vec))
+        return out
+
+
+# ----------------------------- Train / Eval -----------------------------
+
+def build_dataloaders(
+    X: np.ndarray,
+    Y: np.ndarray,
+    split: np.ndarray,
+    taxonomy: Optional[np.ndarray] = None,
+    batch_size: int = 256,
+    num_workers: int = 0,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    idx_train = np.where(split == "train")[0]
+    idx_val = np.where(split == "val")[0]
+    idx_test = np.where(split == "test")[0]
+
+    def subset(arr: np.ndarray, idx: np.ndarray) -> np.ndarray:
+        return arr[idx] if arr is not None else None
+
+    train_ds = ContigDataset(X[idx_train], Y[idx_train], subset(taxonomy, idx_train))
+    val_ds = ContigDataset(X[idx_val], Y[idx_val], subset(taxonomy, idx_val))
+    test_ds = ContigDataset(X[idx_test], Y[idx_test], subset(taxonomy, idx_test))
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
+    return train_loader, val_loader, test_loader
+
+
+@dataclass
+class TrainConfig:
+    epochs: int = 20
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    lambda_align: float = 1.0
+    lambda_bce: float = 1.0
+    lambda_tax: float = 0.0
+
+
+@dataclass
+class TrainState:
+    history: list[dict]
+    class_weights: Optional[torch.Tensor]
+
+
+def compute_class_weights(Y_train: np.ndarray) -> torch.Tensor:
+    pos = Y_train.sum(axis=0) + 1e-3
+    neg = Y_train.shape[0] - pos + 1e-3
+    return torch.from_numpy((neg / pos).astype(np.float32))
+
+
+def train_model(
+    model: HyperAMR,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: TrainConfig,
+    class_weights: Optional[torch.Tensor] = None,
+) -> TrainState:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    history: list[dict] = []
+
+    for ep in range(1, cfg.epochs + 1):
+        tr = _run_epoch(model, train_loader, opt, cfg, class_weights, train=True, device=device)
+        va = _run_epoch(model, val_loader, None, cfg, class_weights, train=False, device=device)
+        rec = {"epoch": ep, "train": tr, "val": va}
+        history.append(rec)
+        print(
+            f"[{ep:02d}] train loss={tr['loss']:.4f} bce={tr['bce']:.4f} align={tr['align']:.4f} | "
+            f"val loss={va['loss']:.4f} bce={va['bce']:.4f} align={va['align']:.4f}"
+        )
+    return TrainState(history=history, class_weights=class_weights)
+
+
+def _run_epoch(
+    model: HyperAMR,
+    loader: DataLoader,
+    opt: Optional[torch.optim.Optimizer],
+    cfg: TrainConfig,
+    class_weights: Optional[torch.Tensor],
+    train: bool,
+    device: torch.device,
+) -> dict:
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = total_bce = total_align = total_tax = 0.0
+    n_obs = 0
+    cw = class_weights.to(device) if class_weights is not None else None
+
+    for xb, yb, tb in loader:
+        xb, yb, tb = xb.to(device), yb.to(device), tb.to(device)
+        if train:
+            opt.zero_grad()
+
+        out = model(xb, yb, tax_idx=tb)
+        loss_align = info_nce_hyper(out["z_seq"], out["z_amr"])
+        loss_bce = bce_with_pos_weight(out["amr_logits"], yb, pos_weight=cw)
+        loss_tax = torch.tensor(0.0, device=device)
+        if model.use_taxonomy and "z_tax" in out:
+            loss_tax = stacked_entailment_radial(out["z_seq"], out["z_tax"], margin=0.05)
+
+        loss = cfg.lambda_align * loss_align + cfg.lambda_bce * loss_bce + cfg.lambda_tax * loss_tax
+
+        if train:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+
+        bs = xb.size(0)
+        n_obs += bs
+        total_loss += loss.item() * bs
+        total_bce += loss_bce.item() * bs
+        total_align += loss_align.item() * bs
+        total_tax += loss_tax.item() * bs
+
+    return {
+        "loss": total_loss / n_obs,
+        "bce": total_bce / n_obs,
+        "align": total_align / n_obs,
+        "tax": total_tax / n_obs,
+    }
+
+
+@dataclass
+class EvalResults:
+    logits: np.ndarray
+    targets: np.ndarray
+    macro_aupr: float
+    macro_auroc: float
+
+
+def evaluate(model: HyperAMR, loader: DataLoader, class_list: Iterable[str]) -> EvalResults:
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    logits_all: list[np.ndarray] = []
+    targets_all: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for xb, yb, tb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            out = model(xb, yb)
+            logits_all.append(out["amr_logits"].cpu().numpy())
+            targets_all.append(yb.cpu().numpy())
+
+    logits = np.concatenate(logits_all, axis=0)
+    targets = np.concatenate(targets_all, axis=0)
+    probs = 1 / (1 + np.exp(-logits))
+
+    aupr_per_class = []
+    auroc_per_class = []
+    C = targets.shape[1]
+    for c in range(C):
+        y_true = targets[:, c]
+        y_prob = probs[:, c]
+        if y_true.sum() == 0 or (y_true == 0).sum() == 0:
+            aupr_per_class.append(np.nan)
+            auroc_per_class.append(np.nan)
+            continue
+        aupr_per_class.append(average_precision_score(y_true, y_prob))
+        try:
+            auroc_per_class.append(roc_auc_score(y_true, y_prob))
+        except ValueError:
+            auroc_per_class.append(np.nan)
+
+    return EvalResults(
+        logits=logits,
+        targets=targets,
+        macro_aupr=float(np.nanmean(aupr_per_class)),
+        macro_auroc=float(np.nanmean(auroc_per_class)),
+    )
+
+
