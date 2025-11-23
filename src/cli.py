@@ -27,10 +27,20 @@ def cmd_download(args: argparse.Namespace):
 
 
 def cmd_run_amrfinder(args: argparse.Namespace):
-    fasta = Path(args.fasta)
     out = Path(args.output)
-    tsv = dutils.run_amrfinder_on_fasta(fasta, out, threads=args.threads, db=Path(args.database) if args.database else None)
-    print(tsv)
+    db = Path(args.database) if args.database else None
+
+    if args.run_many:
+        fastas = [Path(p) for p in _json_list(args.fasta)]
+        if not fastas:
+            raise ValueError("No FASTA paths provided; supply a comma-delimited list with --fasta")
+        for fasta in fastas:
+            tsv = dutils.run_amrfinder_on_fasta(fasta, out, threads=args.threads, db=db)
+            print(tsv)
+    else:
+        fasta = Path(args.fasta)
+        tsv = dutils.run_amrfinder_on_fasta(fasta, out, threads=args.threads, db=db)
+        print(tsv)
 
 
 def cmd_prepare(args: argparse.Namespace):
@@ -115,6 +125,11 @@ def build_parser() -> argparse.ArgumentParser:
     amr.add_argument("--output", required=True)
     amr.add_argument("--threads", type=int, default=4)
     amr.add_argument("--database", default=None, help="Optional AMRFinder database path")
+    amr.add_argument(
+        "--run-many",
+        action="store_true",
+        help="Treat --fasta as a comma-delimited list and run AMRFinder on each entry",
+    )
     amr.set_defaults(func=cmd_run_amrfinder)
 
     prep = sub.add_parser("prepare", help="Build contig labels and attach sequences")
