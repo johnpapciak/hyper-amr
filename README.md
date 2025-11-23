@@ -102,11 +102,10 @@ Key steps align with the notebook:
   `contig_amr_labels.parquet` + `amr_class_list.json` artifacts.
 - **train**: hash sequences into k-mer buckets, configure hyperbolic geometry
   in pure PyTorch, and train/evaluate the joint sequence–AMR model. Optional
-  taxonomy embeddings can be toggled with `--use-taxonomy`. Feature hashing and
-  PyTorch DataLoader construction now support multi-threading via
+  taxonomy embeddings can be toggled with `--use-taxonomy`. For hierarchical
+  supervision, pass lineage columns with `--taxonomy-cols phylum,class,order,family,genus,species`; the
+  model embeds each rank and applies a radial entailment loss along the
+  lineage. Feature hashing and PyTorch DataLoader construction now support multi-threading via
   `--hash-threads` and `--loader-workers`.
 - **plot**: generate AMR class frequency and precision–recall plots from saved
   predictions (`predictions.npz`).
-
-The modules under `hyper_amr/` expose the same functionality for scripted use
-without the CLI.

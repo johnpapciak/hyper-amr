@@ -336,6 +336,41 @@ def train_val_test_split(
     return df
 
 
+def encode_taxonomy_lineage(df: pd.DataFrame, columns: Sequence[str]) -> tuple[np.ndarray | None, dict[str, int]]:
+    """Map taxonomy lineage columns to contiguous integer indices.
+
+    Returns an ``(N, L)`` matrix of integer indices (padding=-1) and a mapping
+    from original taxon IDs to indices. The index ``0`` is reserved for padding;
+    real taxa start at 1.
+    """
+
+    if not columns:
+        return None, {}
+
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing taxonomy columns: {missing}")
+
+    uniq_tax: list[str] = []
+    for col in columns:
+        vals = df[col].astype(str).fillna("")
+        uniq_tax.extend([v for v in vals if v and v != "-1" and v.lower() != "nan"])
+    uniq_tax_sorted = sorted(set(uniq_tax))
+    if not uniq_tax_sorted:
+        return None, {}
+
+    taxid2idx = {t: i + 1 for i, t in enumerate(uniq_tax_sorted)}  # 0 = padding
+    taxonomy = np.full((len(df), len(columns)), -1, dtype=np.int64)
+
+    for j, col in enumerate(columns):
+        vals = df[col].astype(str).fillna("-1")
+        mask = (vals != "-1") & (vals != "") & (vals.str.lower() != "nan")
+        if mask.any():
+            taxonomy[mask.to_numpy(), j] = [taxid2idx[v] for v in vals[mask]]
+
+    return taxonomy, taxid2idx
+
+
 def load_taxonomy_edges(edges_tsv_path: Path, taxid2idx: dict[str, int]) -> np.ndarray | None:
     """Load taxonomy edges (child, parent) into an integer matrix."""
 
