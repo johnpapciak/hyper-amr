@@ -95,6 +95,7 @@ class ModelConfig:
     hidden: int = 512
     embed_dim: int = 128
     use_taxonomy: bool = False
+    taxonomy_levels: int = 1
 
 
 class HyperAMR(nn.Module):
@@ -120,12 +121,18 @@ class HyperAMR(nn.Module):
         )
 
         self.use_taxonomy = cfg.use_taxonomy and cfg.taxonomy_size > 0
+        self.taxonomy_levels = cfg.taxonomy_levels
         if self.use_taxonomy:
             self.taxon_embed = nn.Embedding(cfg.taxonomy_size, cfg.embed_dim)
         else:
             self.taxon_embed = None
 
-    def forward(self, seq_feats: torch.Tensor, amr_targets: torch.Tensor, tax_idx: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        seq_feats: torch.Tensor,
+        amr_targets: torch.Tensor,
+        tax_idx: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         z_seq_euc = self.seq_encoder(seq_feats)
         z_amr_euc = self.amr_encoder(amr_targets)
 
@@ -136,8 +143,26 @@ class HyperAMR(nn.Module):
         out = {"z_seq": z_seq, "z_amr": z_amr, "amr_logits": amr_logits}
 
         if self.use_taxonomy and tax_idx is not None and self.taxon_embed is not None:
-            tax_vec = self.taxon_embed(tax_idx)
-            out["z_tax"] = project_to_ball(exp_map_zero(tax_vec))
+            if tax_idx.dim() == 1:
+                tax_vec = self.taxon_embed(tax_idx.clamp_min(0))
+                out["z_tax"] = project_to_ball(exp_map_zero(tax_vec))
+                out["z_tax_leaf"] = out["z_tax"]
+            elif tax_idx.dim() == 2:
+                B, L = tax_idx.shape
+                tax_idx_clean = tax_idx.clone()
+                mask_missing = tax_idx_clean < 0
+                tax_idx_clean = tax_idx_clean.clamp_min(0)
+
+                z_tax_euc = self.taxon_embed(tax_idx_clean.view(-1))
+                z_tax = project_to_ball(exp_map_zero(z_tax_euc)).view(B, L, self.cfg.embed_dim)
+
+                if mask_missing.any():
+                    z_tax = z_tax.masked_fill(mask_missing.unsqueeze(-1), 0.0)
+
+                out["z_tax_lineage"] = z_tax
+                out["z_tax_leaf"] = z_tax[:, -1, :]
+            else:
+                raise ValueError(f"tax_idx must have dim 1 or 2, got {tax_idx.dim()}")
         return out
 
 
@@ -241,8 +266,22 @@ def _run_epoch(
         loss_align = info_nce_hyper(out["z_seq"], out["z_amr"])
         loss_bce = bce_with_pos_weight(out["amr_logits"], yb, pos_weight=cw)
         loss_tax = torch.tensor(0.0, device=device)
-        if model.use_taxonomy and "z_tax" in out:
-            loss_tax = stacked_entailment_radial(out["z_seq"], out["z_tax"], margin=0.05)
+        if model.use_taxonomy and cfg.lambda_tax > 0.0:
+            if "z_tax_lineage" in out:
+                z_line = out["z_tax_lineage"]  # [B, L, D]
+                B, L, D = z_line.shape
+                if L > 1:
+                    parents = z_line[:, :-1, :].reshape(-1, D)
+                    childs = z_line[:, 1:, :].reshape(-1, D)
+                    p_norm = parents.norm(dim=-1)
+                    c_norm = childs.norm(dim=-1)
+                    valid_mask = (p_norm > 0) & (c_norm > 0)
+                    if valid_mask.any():
+                        loss_tax = stacked_entailment_radial(
+                            parents[valid_mask], childs[valid_mask], margin=0.05
+                        )
+            elif "z_tax" in out:
+                loss_tax = stacked_entailment_radial(out["z_seq"], out["z_tax"], margin=0.05)
 
         loss = cfg.lambda_align * loss_align + cfg.lambda_bce * loss_bce + cfg.lambda_tax * loss_tax
 

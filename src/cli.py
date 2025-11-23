@@ -71,13 +71,28 @@ def cmd_train(args: argparse.Namespace):
     X_seq, Y_amr = dutils.prepare_features(df, class_list, cfg, threads=args.hash_threads)
 
     split = df["split"].values if "split" in df.columns else dutils.train_val_test_split(df)["split"].values
-    taxonomy = df["taxid"].astype(str).values if "taxid" in df.columns else None
+    taxonomy_cols = _json_list(args.taxonomy_cols) if args.taxonomy_cols else []
+    taxonomy = None
+    taxonomy_levels = 1
+    taxid2idx: dict[str, int] = {}
+    if taxonomy_cols or ("taxid" in df.columns and not taxonomy_cols):
+        cols = taxonomy_cols if taxonomy_cols else ["taxid"]
+        taxonomy, taxid2idx = dutils.encode_taxonomy_lineage(df, cols)
+        if taxonomy is not None:
+            taxonomy_levels = taxonomy.shape[1]
 
     train_loader, val_loader, test_loader = mutils.build_dataloaders(
         X_seq, Y_amr, split, taxonomy, num_workers=args.loader_workers
     )
 
-    mcfg = mutils.ModelConfig(seq_dim=X_seq.shape[1], amr_classes=Y_amr.shape[1], taxonomy_size=len(set(taxonomy)) if taxonomy is not None else 0, use_taxonomy=args.use_taxonomy)
+    taxonomy_size = (len(taxid2idx) + 1) if taxid2idx else 0
+    mcfg = mutils.ModelConfig(
+        seq_dim=X_seq.shape[1],
+        amr_classes=Y_amr.shape[1],
+        taxonomy_size=taxonomy_size,
+        use_taxonomy=args.use_taxonomy,
+        taxonomy_levels=taxonomy_levels,
+    )
     model = mutils.HyperAMR(mcfg)
 
     class_weights = mutils.compute_class_weights(Y_amr[split == "train"]) if args.class_weights else None
@@ -160,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--lambda-bce", dest="lambda_bce", type=float, default=1.0)
     tr.add_argument("--lambda-tax", dest="lambda_tax", type=float, default=0.0)
     tr.add_argument("--use-taxonomy", action="store_true")
+    tr.add_argument(
+        "--taxonomy-cols",
+        default=None,
+        help="Comma-delimited lineage columns (e.g., phylum,class,order,family,genus,species)",
+    )
     tr.add_argument("--class-weights", dest="class_weights", action="store_true", help="Use BCE positive weights")
     tr.set_defaults(func=cmd_train)
 
