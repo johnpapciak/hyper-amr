@@ -242,6 +242,46 @@ def build_amr_labels(
     return AmrArtifacts(labels_path=labels_path, classes_path=classes_path)
 
 
+def attach_taxonomy(
+    df: pd.DataFrame,
+    taxonomy_map_path: Path,
+    lineage_path: Path | None = None,
+) -> pd.DataFrame:
+    """Attach taxonomic identifiers/lineages to the label DataFrame.
+
+    ``taxonomy_map_path`` should be a TSV that includes a ``taxid`` column and
+    at least one join key among ``contig_id`` or ``source_file``. Additional
+    lineage columns present in the mapping file are preserved. If
+    ``lineage_path`` is provided, it should be a TSV with ``taxid`` plus lineage
+    ranks (e.g., ``domain``, ``phylum``, ...); any missing lineage columns will
+    be joined from that table.
+    """
+
+    df = df.copy()
+    taxonomy_map = pd.read_csv(taxonomy_map_path, sep="\t")
+    if "taxid" not in taxonomy_map.columns:
+        raise ValueError("taxonomy map must include a 'taxid' column")
+
+    join_keys = [c for c in ("source_file", "contig_id") if c in taxonomy_map.columns]
+    if not join_keys:
+        raise ValueError("taxonomy map must include 'source_file' or 'contig_id' for joining")
+
+    merged = df.merge(taxonomy_map, on=join_keys, how="left")
+
+    if lineage_path is not None:
+        lineage = pd.read_csv(lineage_path, sep="\t")
+        if "taxid" not in lineage.columns:
+            raise ValueError("taxonomy lineage file must include a 'taxid' column")
+
+        lineage_cols = [c for c in lineage.columns if c != "taxid"]
+        # Only bring in lineage columns that are missing from the merged DataFrame.
+        missing_cols = [c for c in lineage_cols if c not in merged.columns]
+        if missing_cols:
+            merged = merged.merge(lineage[["taxid", *missing_cols]], on="taxid", how="left")
+
+    return merged
+
+
 def attach_sequences(df: pd.DataFrame, fasta_files: Sequence[Path]) -> pd.DataFrame:
     """Attach contig sequences from FASTA files to the label DataFrame."""
 

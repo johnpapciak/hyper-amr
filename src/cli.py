@@ -47,9 +47,13 @@ def cmd_prepare(args: argparse.Namespace):
     tsvs = [Path(p) for p in _json_list(args.tsvs)]
     fastas = [Path(p) for p in _json_list(args.fastas)]
     out_dir = Path(args.output)
+    taxonomy_map = Path(args.taxonomy_map) if args.taxonomy_map else None
+    lineage_path = Path(args.taxonomy_lineages) if args.taxonomy_lineages else None
 
     artifacts = dutils.build_amr_labels(tsvs, fastas, out_dir)
     df = pd.read_parquet(artifacts.labels_path)
+    if taxonomy_map is not None:
+        df = dutils.attach_taxonomy(df, taxonomy_map, lineage_path)
     df = dutils.attach_sequences(df, fastas)
     df = dutils.train_val_test_split(df)
     df.to_parquet(artifacts.labels_path, index=False)
@@ -75,8 +79,22 @@ def cmd_train(args: argparse.Namespace):
     taxonomy = None
     taxonomy_levels = 1
     taxid2idx: dict[str, int] = {}
-    if taxonomy_cols or ("taxid" in df.columns and not taxonomy_cols):
-        cols = taxonomy_cols if taxonomy_cols else ["taxid"]
+    if args.use_taxonomy:
+        lineage_pref_order = [
+            "domain",
+            "phylum",
+            "class",
+            "order",
+            "family",
+            "genus",
+            "species",
+        ]
+        if taxonomy_cols:
+            cols = taxonomy_cols
+        else:
+            detected_lineage = [c for c in lineage_pref_order if c in df.columns]
+            cols = detected_lineage if detected_lineage else (["taxid"] if "taxid" in df.columns else [])
+
         taxonomy, taxid2idx = dutils.encode_taxonomy_lineage(df, cols)
         if taxonomy is not None:
             taxonomy_levels = taxonomy.shape[1]
@@ -151,6 +169,16 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--tsvs", required=True, help="Comma-delimited AMRFinder TSV paths")
     prep.add_argument("--fastas", required=True, help="Comma-delimited FASTA paths")
     prep.add_argument("--output", required=True, help="Artifact output directory")
+    prep.add_argument(
+        "--taxonomy-map",
+        default=None,
+        help="Optional TSV mapping contigs/source_files to taxid (and lineage columns)",
+    )
+    prep.add_argument(
+        "--taxonomy-lineages",
+        default=None,
+        help="Optional TSV with taxid and lineage ranks (domain,phylum,class,order,family,genus,species)",
+    )
     prep.set_defaults(func=cmd_prepare)
 
     tr = sub.add_parser("train", help="Hash sequences and train the hyperbolic AMR model")
