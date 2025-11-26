@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional
@@ -201,6 +202,9 @@ class TrainConfig:
     lambda_align: float = 1.0
     lambda_bce: float = 1.0
     lambda_tax: float = 0.0
+    progress_bar: bool = False
+    log_batch_progress: bool = False
+    log_every: int = 50
 
 
 @dataclass
@@ -257,7 +261,16 @@ def _run_epoch(
     n_obs = 0
     cw = class_weights.to(device) if class_weights is not None else None
 
-    for xb, yb, tb in loader:
+    progress_bar = None
+    iterator = loader
+    mode = "train" if train else "eval"
+    if cfg.progress_bar:
+        from tqdm import tqdm
+
+        progress_bar = tqdm(loader, desc=f"{mode} batches", leave=False)
+        iterator = progress_bar
+
+    for batch_idx, (xb, yb, tb) in enumerate(iterator, start=1):
         xb, yb, tb = xb.to(device), yb.to(device), tb.to(device)
         if train:
             opt.zero_grad()
@@ -296,6 +309,29 @@ def _run_epoch(
         total_bce += loss_bce.item() * bs
         total_align += loss_align.item() * bs
         total_tax += loss_tax.item() * bs
+
+        if progress_bar is not None:
+            progress_bar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                bce=f"{loss_bce.item():.4f}",
+                align=f"{loss_align.item():.4f}",
+                tax=f"{loss_tax.item():.4f}",
+            )
+
+        if cfg.log_batch_progress and cfg.log_every > 0 and batch_idx % cfg.log_every == 0:
+            logging.info(
+                "%s batch %d/%d loss=%.4f bce=%.4f align=%.4f tax=%.4f",
+                mode,
+                batch_idx,
+                len(loader),
+                loss.item(),
+                loss_bce.item(),
+                loss_align.item(),
+                loss_tax.item(),
+            )
+
+    if progress_bar is not None:
+        progress_bar.close()
 
     return {
         "loss": total_loss / n_obs,
