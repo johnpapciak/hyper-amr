@@ -95,23 +95,31 @@ def run_amrfinder_on_fasta(
     return out_tsv
 
 
+def _pick_column(df: pd.DataFrame, *candidates: str) -> str | None:
+    lname = {c.lower().strip(): c for c in df.columns}
+    for cand in candidates:
+        if cand in lname:
+            return lname[cand]
+    return None
+
+
+def _contig_column(df: pd.DataFrame) -> str:
+    col = _pick_column(df, "contig id", "contig", "sequence")
+    if col is None:
+        raise ValueError(f"Missing contig column in AMRFinder TSV. Found: {list(df.columns)}")
+    return col
+
+
 def load_amrfinder_tsv(tsv_path: Path) -> pd.DataFrame:
     """Normalize AMRFinder TSV columns into a compact DataFrame."""
 
     df = pd.read_csv(tsv_path, sep="\t", comment="#", dtype=str).fillna("")
-    lname = {c.lower().strip(): c for c in df.columns}
 
-    def pick(*cands):
-        for k in cands:
-            if k in lname:
-                return lname[k]
-        return None
-
-    contig_col = pick("contig id", "contig", "sequence")
-    class_col = pick("class", "drug class", "drug_class")
-    subclass_col = pick("subclass", "drug subclass", "drug_subclass")
-    gene_col = pick("gene symbol", "gene", "symbol", "sequence name")
-    aro_col = pick("aro accession", "aro", "aro_accession")
+    contig_col = _contig_column(df)
+    class_col = _pick_column(df, "class", "drug class", "drug_class")
+    subclass_col = _pick_column(df, "subclass", "drug subclass", "drug_subclass")
+    gene_col = _pick_column(df, "gene symbol", "gene", "symbol", "sequence name")
+    aro_col = _pick_column(df, "aro accession", "aro", "aro_accession")
 
     if contig_col is None or class_col is None:
         raise ValueError(f"Missing required columns in {tsv_path}. Found: {list(df.columns)}")
@@ -177,6 +185,91 @@ def fasta_to_map(path: Path) -> dict[str, str]:
 def right_of_pipe(x: str) -> str:
     t = str(x)
     return t.split("|")[-1] if "|" in t else t
+
+
+def subsample_fasta_and_tsv(
+    fasta_path: Path,
+    tsv_path: Path,
+    output_dir: Path,
+    *,
+    frac: float | None = None,
+    n_contigs: int | None = None,
+    max_contigs: int | None = None,
+    seed: int = 42,
+) -> tuple[Path, Path]:
+    """Subsample contigs from a FASTA and filter the paired AMRFinder TSV.
+
+    This avoids re-running AMRFinder by reusing existing TSV hits and FASTA
+    sequences. Exactly one of ``frac`` (fraction of contigs to keep) or
+    ``n_contigs`` (absolute count) must be provided; whichever is chosen sets
+    the initial sample size relative to the number of contigs available. If
+    ``max_contigs`` is provided, it acts as a hard per-FASTA cap applied after
+    the fraction/count is computed (i.e., the final draw size is
+    ``min(sample_size_from_frac_or_n, max_contigs)``).
+    """
+
+    if (frac is None) == (n_contigs is None):
+        raise ValueError("Provide exactly one of 'frac' or 'n_contigs'")
+
+    fasta_path = Path(fasta_path)
+    tsv_path = Path(tsv_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    contig_ids = all_contig_ids_from_fasta(fasta_path)
+    if not contig_ids:
+        raise ValueError(f"No contigs found in {fasta_path}")
+
+    rng = np.random.default_rng(seed)
+    if n_contigs is not None:
+        if n_contigs <= 0:
+            raise ValueError("n_contigs must be positive")
+        sample_size = min(n_contigs, len(contig_ids))
+    else:
+        if frac is None or not (0.0 < frac <= 1.0):
+            raise ValueError("frac must be in (0, 1]")
+        sample_size = max(1, int(np.floor(len(contig_ids) * frac)))
+        sample_size = min(sample_size, len(contig_ids))
+
+    if max_contigs is not None:
+        if max_contigs <= 0:
+            raise ValueError("max_contigs must be positive")
+        sample_size = min(sample_size, max_contigs)
+
+    chosen = set(rng.choice(contig_ids, size=sample_size, replace=False).tolist())
+
+    fasta_out = output_dir / f"{fasta_path.stem}.subsampled.fasta"
+    tsv_out = output_dir / f"{tsv_path.stem}.subsampled{tsv_path.suffix}"
+
+    # Stream the FASTA to avoid holding all sequences in memory.
+    with open(fasta_path) as fin, open(fasta_out, "w") as fout:
+        write_block = False
+        for line in fin:
+            if line.startswith(">"):
+                cid = line[1:].strip().split()[0]
+                write_block = cid in chosen
+            if write_block:
+                fout.write(line)
+
+    # Preserve AMRFinder comment lines (starting with '#') while filtering rows.
+    comment_lines: list[str] = []
+    with open(tsv_path) as tf:
+        for line in tf:
+            if line.startswith("#"):
+                comment_lines.append(line.rstrip("\n"))
+            else:
+                break
+
+    tsv_df = pd.read_csv(tsv_path, sep="\t", comment="#", dtype=str)
+    contig_col = _contig_column(tsv_df)
+    filtered = tsv_df[tsv_df[contig_col].astype(str).isin(chosen)]
+
+    with open(tsv_out, "w") as out:
+        for c in comment_lines:
+            out.write(c + "\n")
+        filtered.to_csv(out, sep="\t", index=False)
+
+    return fasta_out, tsv_out
 
 
 # --------------------------- Label preparation --------------------------

@@ -43,6 +43,39 @@ def cmd_run_amrfinder(args: argparse.Namespace):
         print(tsv)
 
 
+def cmd_subsample(args: argparse.Namespace):
+    tsvs = [Path(p) for p in _json_list(args.tsvs)]
+    fastas = [Path(p) for p in _json_list(args.fastas)]
+    if not tsvs or not fastas:
+        raise ValueError("Provide at least one TSV and FASTA to subsample")
+
+    tsv_by_stem: dict[str, Path] = {}
+    for t in tsvs:
+        stem = Path(t).stem.replace(".amrfinder", "")
+        if stem in tsv_by_stem:
+            raise ValueError(f"Duplicate TSV stem detected: {stem}")
+        tsv_by_stem[stem] = t
+
+    out_dir = Path(args.output)
+    for fasta in fastas:
+        stem = Path(fasta).stem
+        tsv_path = tsv_by_stem.get(stem)
+        if tsv_path is None:
+            raise ValueError(f"No TSV found for FASTA stem '{stem}'")
+
+        fasta_out, tsv_out = dutils.subsample_fasta_and_tsv(
+            fasta,
+            tsv_path,
+            out_dir,
+            frac=args.frac,
+            n_contigs=args.num_contigs,
+            max_contigs=args.max_contigs,
+            seed=args.seed,
+        )
+        print(f"Subsampled FASTA -> {fasta_out}")
+        print(f"Subsampled TSV   -> {tsv_out}")
+
+
 def cmd_prepare(args: argparse.Namespace):
     tsvs = [Path(p) for p in _json_list(args.tsvs)]
     fastas = [Path(p) for p in _json_list(args.fastas)]
@@ -164,6 +197,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat --fasta as a comma-delimited list and run AMRFinder on each entry",
     )
     amr.set_defaults(func=cmd_run_amrfinder)
+
+    sub_sample = sub.add_parser(
+        "subsample", help="Subsample FASTA/TSV pairs without rerunning AMRFinder"
+    )
+    sub_sample.add_argument("--tsvs", required=True, help="Comma-delimited AMRFinder TSV paths")
+    sub_sample.add_argument("--fastas", required=True, help="Comma-delimited FASTA paths")
+    sub_sample.add_argument("--output", required=True, help="Output directory for subsampled files")
+    sub_sample.add_argument(
+        "--frac",
+        type=float,
+        default=None,
+        help="Fraction of contigs to keep (provide this or --num-contigs)",
+    )
+    sub_sample.add_argument(
+        "--num-contigs",
+        dest="num_contigs",
+        type=int,
+        default=None,
+        help="Absolute number of contigs to keep (provide this or --frac)",
+    )
+    sub_sample.add_argument(
+        "--max-contigs",
+        dest="max_contigs",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on contigs kept per file (applied after --frac/--num-contigs); "
+            "use with --frac 1.0 to only trim oversized FASTAs while leaving smaller ones intact"
+        ),
+    )
+    sub_sample.add_argument("--seed", type=int, default=42, help="RNG seed for sampling")
+    sub_sample.set_defaults(func=cmd_subsample)
 
     prep = sub.add_parser("prepare", help="Build contig labels and attach sequences")
     prep.add_argument("--tsvs", required=True, help="Comma-delimited AMRFinder TSV paths")
