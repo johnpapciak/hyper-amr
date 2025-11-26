@@ -88,6 +88,8 @@ pip install -r requirements.txt
 ```bash
 python -m hyper_amr.cli download --urls https://.../genome.fasta --output data/raw
 python -m hyper_amr.cli run-amrfinder --fasta data/raw/genome.fasta --output data/amrfinder
+python -m hyper_amr.cli subsample --tsvs data/amrfinder/genome.amrfinder.tsv --fastas data/raw/genome.fasta \
+    --output data/subsampled --frac 0.1 --max-contigs 5000
 python -m hyper_amr.cli prepare --tsvs data/amrfinder/genome.amrfinder.tsv \
     --fastas data/raw/genome.fasta --output data/artifacts
 python -m hyper_amr.cli train --artifacts data/artifacts --fastas data/raw/genome.fasta \
@@ -98,6 +100,12 @@ python -m hyper_amr.cli plot --artifacts data/artifacts
 Key steps align with the notebook:
 - **download**: optional helper to fetch FASTA genomes from URLs.
 - **run-amrfinder**: execute AMRFinderPlus per FASTA (plus DB supported).
+- **subsample**: downsample FASTA/TSV pairs (by fraction or count) without re-running
+  AMRFinder to create lighter test datasets.
+  You can run this before `prepare` to shrink large genomes; set `--frac` or
+  `--num-contigs` globally and optionally cap per-file size with `--max-contigs`
+  so oversized FASTAs are reduced more aggressively than smaller ones.
+
 - **prepare**: build contig-level AMR labels, attach sequences, and store
   `contig_amr_labels.parquet` + `amr_class_list.json` artifacts.
 - **train**: hash sequences into k-mer buckets, configure hyperbolic geometry
