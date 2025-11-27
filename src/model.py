@@ -23,9 +23,11 @@ def project_to_ball(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
 
 
 def exp_map_zero(v: torch.Tensor, c: float = 1.0, eps: float = 1e-5) -> torch.Tensor:
-    norm = torch.norm(v, dim=-1, keepdim=True).clamp(min=eps)
-    factor = torch.tanh(torch.sqrt(c) * norm) / (torch.sqrt(c) * norm)
-    return project_to_ball(v * factor)
+   norm = torch.norm(v, dim=-1, keepdim=True).clamp(min=eps)
+   c_t = v.new_tensor(c)               # tensor with same device/dtype as v
+   sqrt_c = torch.sqrt(c_t)
+   factor = torch.tanh(sqrt_c * norm) / (sqrt_c * norm)
+   return project_to_ball(v * factor)
 
 
 def mobius_add(x: torch.Tensor, y: torch.Tensor, c: float = 1.0, eps: float = 1e-5) -> torch.Tensor:
@@ -38,13 +40,14 @@ def mobius_add(x: torch.Tensor, y: torch.Tensor, c: float = 1.0, eps: float = 1e
 
 
 def poincare_distance(x: torch.Tensor, y: torch.Tensor, c: float = 1.0, eps: float = 1e-5) -> torch.Tensor:
-    # https://arxiv.org/abs/1705.08039
-    x2 = torch.sum(x * x, dim=-1, keepdim=True)
-    y2 = torch.sum(y * y, dim=-1, keepdim=True)
-    xy = torch.sum((x - y) * (x - y), dim=-1, keepdim=True)
-    num = 2 * torch.sqrt(c) * torch.sqrt(xy)
-    denom = (1 - c * x2).clamp(min=eps) * (1 - c * y2).clamp(min=eps)
-    return torch.acosh(1 + num / denom).squeeze(-1)
+   x2 = torch.sum(x * x, dim=-1, keepdim=True)
+   y2 = torch.sum(y * y, dim=-1, keepdim=True)
+   xy = torch.sum((x - y) * (x - y), dim=-1, keepdim=True)
+   c_t = xy.new_tensor(c)              # tensor on same device/dtype
+   sqrt_c = torch.sqrt(c_t)
+   num = 2 * sqrt_c * torch.sqrt(xy)
+   denom = (1 - c_t * x2).clamp(min=eps) * (1 - c_t * y2).clamp(min=eps)
+   return torch.acosh(1 + num / denom).squeeze(-1)
 
 
 def info_nce_hyper(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
@@ -202,8 +205,8 @@ class TrainConfig:
     lambda_align: float = 1.0
     lambda_bce: float = 1.0
     lambda_tax: float = 0.0
-    progress_bar: bool = False
-    log_batch_progress: bool = False
+    progress_bar: bool = True
+    log_batch_progress: bool = True
     log_every: int = 50
 
 
