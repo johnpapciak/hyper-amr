@@ -150,12 +150,25 @@ def cmd_train(args: argparse.Namespace):
     tcfg = mutils.TrainConfig(epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay, lambda_align=args.lambda_align, lambda_bce=args.lambda_bce, lambda_tax=args.lambda_tax)
 
     state = mutils.train_model(model, train_loader, val_loader, tcfg, class_weights=class_weights)
-    results = mutils.evaluate(model, test_loader, class_list)
+    results = mutils.evaluate(
+        model,
+        test_loader,
+        class_list,
+        calibrate_thresholds=args.calibrate_thresholds,
+        calibration_loader=val_loader if args.calibrate_thresholds else None,
+        calibration_metric=args.calibration_metric,
+    )
 
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     torch_path = artifacts_dir / "model.pt"
     torch.save({"model_state": model.state_dict(), "config": mcfg.__dict__}, torch_path)
-    np.savez(artifacts_dir / "predictions.npz", logits=results.logits, targets=results.targets)
+    np.savez(
+        artifacts_dir / "predictions.npz",
+        logits=results.logits,
+        targets=results.targets,
+        predictions=results.predictions,
+        thresholds=results.thresholds,
+    )
     metrics_df = pd.DataFrame(
         {
             "amr_class": class_list,
@@ -344,6 +357,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-delimited lineage columns (e.g., phylum,class,order,family,genus,species)",
     )
     tr.add_argument("--class-weights", dest="class_weights", action="store_true", help="Use BCE positive weights")
+    tr.add_argument(
+        "--calibrate-thresholds",
+        action="store_true",
+        help="Search per-class decision thresholds on the validation set",
+    )
+    tr.add_argument(
+        "--calibration-metric",
+        default="f1",
+        choices=["f1", "average_precision"],
+        help="Objective to optimize during threshold search",
+    )
     tr.set_defaults(func=cmd_train)
 
     bal = sub.add_parser(
