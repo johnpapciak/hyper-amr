@@ -347,6 +347,10 @@ class EvalResults:
     targets: np.ndarray
     macro_aupr: float
     macro_auroc: float
+    aupr_per_class: list[float]
+    auroc_per_class: list[float]
+    accuracy_per_class: list[float]
+    overall_accuracy: float
 
 
 def evaluate(model: HyperAMR, loader: DataLoader, class_list: Iterable[str]) -> EvalResults:
@@ -367,13 +371,17 @@ def evaluate(model: HyperAMR, loader: DataLoader, class_list: Iterable[str]) -> 
     logits = np.concatenate(logits_all, axis=0)
     targets = np.concatenate(targets_all, axis=0)
     probs = 1 / (1 + np.exp(-logits))
+    preds = (probs >= 0.5).astype(np.float32)
 
     aupr_per_class = []
     auroc_per_class = []
+    accuracy_per_class = []
     C = targets.shape[1]
     for c in range(C):
         y_true = targets[:, c]
         y_prob = probs[:, c]
+        y_pred = preds[:, c]
+        accuracy_per_class.append(float((y_pred == y_true).mean()))
         if y_true.sum() == 0 or (y_true == 0).sum() == 0:
             aupr_per_class.append(np.nan)
             auroc_per_class.append(np.nan)
@@ -389,6 +397,10 @@ def evaluate(model: HyperAMR, loader: DataLoader, class_list: Iterable[str]) -> 
         targets=targets,
         macro_aupr=float(np.nanmean(aupr_per_class)),
         macro_auroc=float(np.nanmean(auroc_per_class)),
+        aupr_per_class=aupr_per_class,
+        auroc_per_class=auroc_per_class,
+        accuracy_per_class=accuracy_per_class,
+        overall_accuracy=float((preds == targets).mean()),
     )
 
 
