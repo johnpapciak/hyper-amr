@@ -156,7 +156,34 @@ def cmd_train(args: argparse.Namespace):
     torch_path = artifacts_dir / "model.pt"
     torch.save({"model_state": model.state_dict(), "config": mcfg.__dict__}, torch_path)
     np.savez(artifacts_dir / "predictions.npz", logits=results.logits, targets=results.targets)
+    metrics_df = pd.DataFrame(
+        {
+            "amr_class": class_list,
+            "accuracy": results.accuracy_per_class,
+            "aupr": results.aupr_per_class,
+            "auroc": results.auroc_per_class,
+        }
+    )
+    metrics_df = pd.concat(
+        [
+            metrics_df,
+            pd.DataFrame(
+                [
+                    {
+                        "amr_class": "OVERALL",
+                        "accuracy": results.overall_accuracy,
+                        "aupr": results.macro_aupr,
+                        "auroc": results.macro_auroc,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    metrics_path = artifacts_dir / "evaluation_metrics.csv"
+    metrics_df.to_csv(metrics_path, index=False)
     print(f"Saved model -> {torch_path}")
+    print(f"Saved evaluation metrics -> {metrics_path}")
     print(f"Test macro AUPR={results.macro_aupr:.4f} | AUROC={results.macro_auroc:.4f}")
  
 
