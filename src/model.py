@@ -345,6 +345,8 @@ def _run_epoch(
 class EvalResults:
     logits: np.ndarray
     targets: np.ndarray
+    predictions: np.ndarray
+    thresholds: np.ndarray
     macro_aupr: float
     macro_auroc: float
     aupr_per_class: list[float]
@@ -353,11 +355,9 @@ class EvalResults:
     overall_accuracy: float
 
 
-def evaluate(model: HyperAMR, loader: DataLoader, class_list: Iterable[str]) -> EvalResults:
-    from sklearn.metrics import average_precision_score, roc_auc_score
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.eval()
+def _collect_logits_and_targets(
+    model: HyperAMR, loader: DataLoader, device: torch.device
+) -> tuple[np.ndarray, np.ndarray]:
     logits_all: list[np.ndarray] = []
     targets_all: list[np.ndarray] = []
 
@@ -370,8 +370,79 @@ def evaluate(model: HyperAMR, loader: DataLoader, class_list: Iterable[str]) -> 
 
     logits = np.concatenate(logits_all, axis=0)
     targets = np.concatenate(targets_all, axis=0)
+    return logits, targets
+
+
+def _search_thresholds(
+    model: HyperAMR,
+    loader: DataLoader,
+    device: torch.device,
+    metric: str = "f1",
+    default: float = 0.5,
+) -> np.ndarray:
+    from sklearn.metrics import average_precision_score, f1_score
+
+    logits, targets = _collect_logits_and_targets(model, loader, device)
     probs = 1 / (1 + np.exp(-logits))
-    preds = (probs >= 0.5).astype(np.float32)
+    C = targets.shape[1]
+    thresholds = np.full(C, default, dtype=np.float32)
+    candidate_thresholds = np.linspace(0.0, 1.0, 101)
+
+    for c in range(C):
+        y_true = targets[:, c]
+        y_prob = probs[:, c]
+        if y_true.sum() == 0 or (y_true == 0).sum() == 0:
+            # Degenerate class; keep default threshold.
+            continue
+
+        best_score = float("-inf")
+        best_thr = default
+        for thr in candidate_thresholds:
+            preds = (y_prob >= thr).astype(np.float32)
+            if metric == "f1":
+                score = f1_score(y_true, preds, zero_division=0)
+            elif metric == "average_precision":
+                score = average_precision_score(y_true, preds)
+            else:
+                raise ValueError(f"Unsupported calibration metric: {metric}")
+
+            if score > best_score:
+                best_score = score
+                best_thr = float(thr)
+
+        thresholds[c] = best_thr
+
+    return thresholds
+
+
+def evaluate(
+    model: HyperAMR,
+    loader: DataLoader,
+    class_list: Iterable[str],
+    thresholds: Optional[np.ndarray] = None,
+    calibrate_thresholds: bool = False,
+    calibration_loader: Optional[DataLoader] = None,
+    calibration_metric: str = "f1",
+) -> EvalResults:
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    class_list = list(class_list)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+
+    if thresholds is None:
+        if calibrate_thresholds:
+            if calibration_loader is None:
+                raise ValueError("calibration_loader must be provided when calibrating thresholds")
+            thresholds = _search_thresholds(
+                model, calibration_loader, device, metric=calibration_metric
+            )
+        else:
+            thresholds = np.full(len(class_list), 0.5, dtype=np.float32)
+
+    logits, targets = _collect_logits_and_targets(model, loader, device)
+    probs = 1 / (1 + np.exp(-logits))
+    preds = (probs >= thresholds).astype(np.float32)
 
     aupr_per_class = []
     auroc_per_class = []
@@ -395,6 +466,8 @@ def evaluate(model: HyperAMR, loader: DataLoader, class_list: Iterable[str]) -> 
     return EvalResults(
         logits=logits,
         targets=targets,
+        predictions=preds,
+        thresholds=thresholds,
         macro_aupr=float(np.nanmean(aupr_per_class)),
         macro_auroc=float(np.nanmean(auroc_per_class)),
         aupr_per_class=aupr_per_class,
