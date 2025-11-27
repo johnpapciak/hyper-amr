@@ -92,6 +92,7 @@ python -m hyper_amr.cli subsample --tsvs data/amrfinder/genome.amrfinder.tsv --f
     --output data/subsampled --frac 0.1 --max-contigs 5000
 python -m hyper_amr.cli prepare --tsvs data/amrfinder/genome.amrfinder.tsv \
     --fastas data/raw/genome.fasta --output data/artifacts
+python -m hyper_amr.cli balance --artifacts data/artifacts --fastas data/raw/genome.fasta
 python -m hyper_amr.cli train --artifacts data/artifacts --fastas data/raw/genome.fasta \
     --epochs 5 --k 5 --buckets 4096 --class-weights --hash-threads 4 --loader-workers 4
 python -m hyper_amr.cli plot --artifacts data/artifacts
@@ -108,6 +109,8 @@ Key steps align with the notebook:
 
 - **prepare**: build contig-level AMR labels, attach sequences, and store
   `contig_amr_labels.parquet` + `amr_class_list.json` artifacts.
+- **balance**: inspect AMR class balance per source FASTA (saves
+  `label_balance_by_source.csv`) to validate label coverage before training.
 - **train**: hash sequences into k-mer buckets, configure hyperbolic geometry
   in pure PyTorch, and train/evaluate the joint sequence–AMR model. Optional
   taxonomy embeddings can be toggled with `--use-taxonomy`. For hierarchical

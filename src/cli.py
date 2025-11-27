@@ -158,7 +158,50 @@ def cmd_train(args: argparse.Namespace):
     np.savez(artifacts_dir / "predictions.npz", logits=results.logits, targets=results.targets)
     print(f"Saved model -> {torch_path}")
     print(f"Test macro AUPR={results.macro_aupr:.4f} | AUROC={results.macro_auroc:.4f}")
+ 
 
+def cmd_balance(args: argparse.Namespace):
+    artifacts_dir = Path(args.artifacts)
+    labels_path = artifacts_dir / "contig_amr_labels.parquet"
+    classes_path = artifacts_dir / "amr_class_list.json"
+
+    df = pd.read_parquet(labels_path)
+    with open(classes_path) as f:
+        class_list = json.load(f)["class_list"]
+
+    fastas = [Path(p) for p in _json_list(args.fastas)]
+    if not fastas:
+        raise ValueError("Provide at least one FASTA path with --fastas")
+
+    needs_source = "source_file" not in df.columns or df["source_file"].isna().any()
+    if needs_source:
+        contig_to_source: dict[str, str] = {}
+        for fasta in fastas:
+            src = fasta.stem
+            for cid in dutils.all_contig_ids_from_fasta(fasta):
+                contig_to_source[cid] = src
+                contig_to_source[dutils.right_of_pipe(cid)] = src
+
+        if "source_file" not in df.columns:
+            df["source_file"] = df["contig_id"].map(contig_to_source)
+        else:
+            missing = df["source_file"].isna()
+            df.loc[missing, "source_file"] = df.loc[missing, "contig_id"].map(contig_to_source)
+
+        if df["source_file"].isna().any():
+            missing_ids = df[df["source_file"].isna()]["contig_id"].unique().tolist()
+            raise ValueError(
+                "Unable to infer source_file for contigs: "
+                + ", ".join(missing_ids[:5])
+                + ("..." if len(missing_ids) > 5 else "")
+            )
+
+    balance = dutils.amr_balance_by_source(df, class_list)
+    out_path = artifacts_dir / "label_balance_by_source.csv"
+    balance.to_csv(out_path, index=False)
+
+    print(balance.head())
+    print(f"Saved label balance -> {out_path}")
 
 
 def cmd_plot(args: argparse.Namespace):
@@ -275,6 +318,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tr.add_argument("--class-weights", dest="class_weights", action="store_true", help="Use BCE positive weights")
     tr.set_defaults(func=cmd_train)
+
+    bal = sub.add_parser(
+        "balance",
+        help="Summarize AMR label balance by source file (before training)",
+    )
+    bal.add_argument("--artifacts", required=True, help="Directory with contig_amr_labels.parquet")
+    bal.add_argument(
+        "--fastas",
+        required=True,
+        help="Comma-delimited FASTA paths (used to recover missing source_file entries)",
+    )
+    bal.set_defaults(func=cmd_balance)
 
     pl = sub.add_parser("plot", help="Plot AMR class frequency and PR curves from saved predictions")
     pl.add_argument("--artifacts", required=True, help="Directory containing predictions.npz and amr_class_list.json")

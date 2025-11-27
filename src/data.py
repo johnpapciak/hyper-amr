@@ -391,6 +391,80 @@ def attach_sequences(df: pd.DataFrame, fasta_files: Sequence[Path]) -> pd.DataFr
     return df
 
 
+# --------------------------- Dataset diagnostics ---------------------------
+
+def amr_balance_by_source(
+    df: pd.DataFrame, class_list: Sequence[str] | None = None
+) -> pd.DataFrame:
+    """Summarize AMR label balance per ``source_file``.
+
+    The returned DataFrame includes overall counts of AMR-positive/negative
+    contigs and per-class totals for each source. ``class_list`` (if provided)
+    names the columns corresponding to ``label_vector`` entries; otherwise
+    class names are inferred from ``df['class']`` when available or fall back
+    to generic ``class_#`` labels.
+    """
+
+    if "source_file" not in df.columns:
+        raise ValueError("contig_amr_labels must include a 'source_file' column")
+    if "label_vector" not in df.columns:
+        raise ValueError("contig_amr_labels must include a 'label_vector' column")
+
+    def _to_array(v):
+        if isinstance(v, (list, tuple, np.ndarray)):
+            return np.array(v, dtype=np.int64)
+        try:
+            return np.array(json.loads(v), dtype=np.int64)
+        except TypeError as exc:  # pragma: no cover - defensive
+            raise ValueError("label_vector entries must be list-like") from exc
+
+    label_matrix = np.stack([_to_array(v) for v in df["label_vector"].values])
+
+    if class_list is None:
+        inferred: list[str] = []
+        if "class" in df.columns:
+            for row in df["class"]:
+                if isinstance(row, (list, tuple, set)):
+                    inferred.extend(row)
+                elif isinstance(row, str) and row.startswith("["):
+                    try:
+                        inferred.extend(json.loads(row))
+                    except json.JSONDecodeError:
+                        pass
+        inferred = sorted(set(inferred))
+        classes = inferred if len(inferred) == label_matrix.shape[1] else [
+            f"class_{i}" for i in range(label_matrix.shape[1])
+        ]
+    else:
+        classes = list(class_list)
+        if len(classes) != label_matrix.shape[1]:
+            raise ValueError(
+                "class_list length does not match the width of label_vector entries"
+            )
+
+    is_positive = (
+        df["is_amr_positive"].astype(bool).to_numpy()
+        if "is_amr_positive" in df.columns
+        else label_matrix.sum(axis=1) > 0
+    )
+
+    class_df = pd.DataFrame(label_matrix, columns=classes)
+    grouped = pd.concat(
+        [df[["source_file"]].reset_index(drop=True), pd.Series(is_positive, name="is_amr_positive"), class_df],
+        axis=1,
+    ).groupby("source_file")
+
+    summary = grouped["is_amr_positive"].agg(num_contigs="count", num_positive="sum")
+    class_counts = grouped[classes].sum()
+
+    out = summary.join(class_counts)
+    out["num_negative"] = out["num_contigs"] - out["num_positive"]
+    out["positive_frac"] = out["num_positive"] / out["num_contigs"]
+
+    ordered_cols = ["source_file", "num_contigs", "num_positive", "num_negative", "positive_frac", *classes]
+    return out.reset_index()[ordered_cols]
+
+
 # --------------------------- Feature building ---------------------------
 
 def hash_kmers_fast(seq: str, cfg: HashingConfig) -> np.ndarray:
