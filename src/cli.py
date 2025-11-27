@@ -98,6 +98,10 @@ def cmd_train(args: argparse.Namespace):
     artifacts_dir = Path(args.artifacts)
     labels_path = artifacts_dir / "contig_amr_labels.parquet"
     classes_path = artifacts_dir / "amr_class_list.json"
+    output_suffix = args.output_suffix.strip()
+
+    def _with_suffix(path: Path) -> Path:
+        return path.with_name(f"{path.stem}_{output_suffix}{path.suffix}") if output_suffix else path
 
     df = pd.read_parquet(labels_path)
     with open(classes_path) as f:
@@ -160,10 +164,10 @@ def cmd_train(args: argparse.Namespace):
     )
 
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    torch_path = artifacts_dir / "model.pt"
+    torch_path = _with_suffix(artifacts_dir / "model.pt")
     torch.save({"model_state": model.state_dict(), "config": mcfg.__dict__}, torch_path)
     np.savez(
-        artifacts_dir / "predictions.npz",
+        _with_suffix(artifacts_dir / "predictions.npz"),
         logits=results.logits,
         targets=results.targets,
         predictions=results.predictions,
@@ -193,7 +197,7 @@ def cmd_train(args: argparse.Namespace):
         ],
         ignore_index=True,
     )
-    metrics_path = artifacts_dir / "evaluation_metrics.csv"
+    metrics_path = _with_suffix(artifacts_dir / "evaluation_metrics.csv")
     metrics_df.to_csv(metrics_path, index=False)
     print(f"Saved model -> {torch_path}")
     print(f"Saved evaluation metrics -> {metrics_path}")
@@ -351,6 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--lambda-bce", dest="lambda_bce", type=float, default=1.0)
     tr.add_argument("--lambda-tax", dest="lambda_tax", type=float, default=0.0)
     tr.add_argument("--use-taxonomy", action="store_true")
+    tr.add_argument(
+        "--output-suffix",
+        dest="output_suffix",
+        default="",
+        help="Optional suffix to append to saved model/prediction/metrics outputs",
+    )
     tr.add_argument(
         "--taxonomy-cols",
         default=None,
