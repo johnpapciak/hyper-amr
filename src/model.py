@@ -351,6 +351,10 @@ def _run_epoch(
     if progress_bar is not None:
         progress_bar.close()
 
+    if n_obs == 0:
+        logging.warning("%s epoch produced no valid observations; returning NaN metrics", mode)
+        return {"loss": float("nan"), "bce": float("nan"), "align": float("nan"), "tax": float("nan")}
+
     return {
         "loss": total_loss / n_obs,
         "bce": total_bce / n_obs,
