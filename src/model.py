@@ -47,7 +47,18 @@ def poincare_distance(x: torch.Tensor, y: torch.Tensor, c: float = 1.0, eps: flo
    sqrt_c = torch.sqrt(c_t)
    num = 2 * sqrt_c * torch.sqrt(xy)
    denom = (1 - c_t * x2).clamp(min=eps) * (1 - c_t * y2).clamp(min=eps)
-   return torch.acosh(1 + num / denom).squeeze(-1)
+
+   finite_mask = (
+       torch.isfinite(x2)
+       & torch.isfinite(y2)
+       & torch.isfinite(xy)
+       & torch.isfinite(num)
+       & torch.isfinite(denom)
+   )
+
+   acosh_arg = torch.clamp_min(1 + num / denom, 1 + eps)
+   dist = torch.acosh(acosh_arg).squeeze(-1)
+   return torch.where(finite_mask.squeeze(-1), dist, torch.zeros_like(dist))
 
 
 def info_nce_hyper(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
@@ -300,6 +311,10 @@ def _run_epoch(
                 loss_tax = stacked_entailment_radial(out["z_seq"], out["z_tax"], margin=0.05)
 
         loss = cfg.lambda_align * loss_align + cfg.lambda_bce * loss_bce + cfg.lambda_tax * loss_tax
+
+        if not torch.isfinite(loss) or not torch.isfinite(loss_align) or not torch.isfinite(loss_bce) or not torch.isfinite(loss_tax):
+            logging.warning("Skipping batch %d due to non-finite loss components", batch_idx)
+            continue
 
         if train:
             loss.backward()
