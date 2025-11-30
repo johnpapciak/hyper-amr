@@ -521,6 +521,38 @@ def prepare_features(
     return X_seq, Y_amr
 
 
+def sanitize_prepared_labels(df: pd.DataFrame, class_list: Sequence[str]) -> pd.DataFrame:
+    """Ensure label vectors are finite and drop rows missing sequences."""
+
+    if "label_vector" not in df.columns:
+        raise ValueError("contig_amr_labels must include a 'label_vector' column")
+
+    expected_len = len(class_list)
+
+    def _clean_label_vector(v: object) -> np.ndarray:
+        arr = np.array(
+            v if isinstance(v, (list, tuple, np.ndarray)) else json.loads(v),
+            dtype=np.float32,
+        )
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        if arr.shape[0] != expected_len:
+            raise ValueError(
+                "Label vector length does not match AMR class list; "
+                "rebuild artifacts or fix the offending row"
+            )
+        return arr
+
+    cleaned = df.copy()
+    cleaned["label_vector"] = cleaned["label_vector"].apply(_clean_label_vector)
+
+    if "sequence" in cleaned.columns:
+        missing_seq = cleaned["sequence"].isna()
+        if missing_seq.any():
+            cleaned = cleaned.loc[~missing_seq].copy()
+
+    return cleaned
+
+
 def train_val_test_split(
     df: pd.DataFrame,
     train_frac: float = 0.7,

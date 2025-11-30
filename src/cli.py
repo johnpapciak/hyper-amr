@@ -85,9 +85,12 @@ def cmd_prepare(args: argparse.Namespace):
 
     artifacts = dutils.build_amr_labels(tsvs, fastas, out_dir)
     df = pd.read_parquet(artifacts.labels_path)
+    with open(artifacts.classes_path) as f:
+        class_list = json.load(f)["class_list"]
     if taxonomy_map is not None:
         df = dutils.attach_taxonomy(df, taxonomy_map, lineage_path)
     df = dutils.attach_sequences(df, fastas)
+    df = dutils.sanitize_prepared_labels(df, class_list)
     df = dutils.train_val_test_split(df)
     df.to_parquet(artifacts.labels_path, index=False)
     print(f"Saved labels -> {artifacts.labels_path}")
