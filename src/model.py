@@ -188,9 +188,12 @@ def build_dataloaders(
     Y: np.ndarray,
     split: np.ndarray,
     taxonomy: Optional[np.ndarray] = None,
+    taxonomy_size: int | None = None,
     batch_size: int = 256,
     num_workers: int = 0,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
+    _validate_taxonomy_indices(taxonomy, taxonomy_size)
+
     idx_train = np.where(split == "train")[0]
     idx_val = np.where(split == "val")[0]
     idx_test = np.where(split == "test")[0]
@@ -206,6 +209,41 @@ def build_dataloaders(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
     return train_loader, val_loader, test_loader
+
+
+def _validate_taxonomy_indices(taxonomy: Optional[np.ndarray], taxonomy_size: int | None):
+    """Fail fast when taxonomy indices fall outside the configured range."""
+
+    if taxonomy is None or taxonomy_size is None:
+        return
+
+    if taxonomy_size <= 0:
+        raise ValueError("taxonomy_size must be positive when taxonomy indices are provided")
+
+    tax = np.asarray(taxonomy)
+    if tax.size == 0:
+        return
+
+    invalid_nan = np.isnan(tax)
+    invalid_negative = tax < 0
+    invalid_large = tax >= taxonomy_size
+
+    invalid_mask = invalid_nan | invalid_negative | invalid_large
+    if invalid_mask.any():
+        coords = np.argwhere(invalid_mask)
+        summary = []
+        for label, mask in ("NaN", invalid_nan), ("<0", invalid_negative), (">= taxonomy_size", invalid_large):
+            count = int(mask.sum())
+            if count:
+                summary.append(f"{label}: {count}")
+
+        samples = coords[:10].tolist()
+        msg = (
+            "Invalid taxonomy indices detected before DataLoader construction. "
+            + "; ".join(summary)
+            + f"; first offending indices (row, col): {samples}"
+        )
+        raise ValueError(msg)
 
 
 @dataclass

@@ -136,11 +136,16 @@ def cmd_train(args: argparse.Namespace):
         if taxonomy is not None:
             taxonomy_levels = taxonomy.shape[1]
 
+    taxonomy_size = (len(taxid2idx) + 1) if taxid2idx else 0
     train_loader, val_loader, test_loader = mutils.build_dataloaders(
-        X_seq, Y_amr, split, taxonomy, num_workers=args.loader_workers
+        X_seq,
+        Y_amr,
+        split,
+        taxonomy,
+        taxonomy_size=taxonomy_size if args.use_taxonomy else None,
+        num_workers=args.loader_workers,
     )
 
-    taxonomy_size = (len(taxid2idx) + 1) if taxid2idx else 0
     mcfg = mutils.ModelConfig(
         seq_dim=X_seq.shape[1],
         amr_classes=Y_amr.shape[1],
