@@ -103,6 +103,12 @@ def cmd_train(args: argparse.Namespace):
     def _with_suffix(path: Path) -> Path:
         return path.with_name(f"{path.stem}_{output_suffix}{path.suffix}") if output_suffix else path
 
+    batch_log_path = (
+        Path(args.batch_log_path)
+        if args.batch_log_path
+        else _with_suffix(artifacts_dir / "train_batch_log.csv")
+    )
+
     df = pd.read_parquet(labels_path)
     with open(classes_path) as f:
         class_list = json.load(f)["class_list"]
@@ -156,7 +162,15 @@ def cmd_train(args: argparse.Namespace):
     model = mutils.HyperAMR(mcfg)
 
     class_weights = mutils.compute_class_weights(Y_amr[split == "train"]) if args.class_weights else None
-    tcfg = mutils.TrainConfig(epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay, lambda_align=args.lambda_align, lambda_bce=args.lambda_bce, lambda_tax=args.lambda_tax)
+    tcfg = mutils.TrainConfig(
+        epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        lambda_align=args.lambda_align,
+        lambda_bce=args.lambda_bce,
+        lambda_tax=args.lambda_tax,
+        batch_log_path=batch_log_path,
+    )
 
     state = mutils.train_model(model, train_loader, val_loader, tcfg, class_weights=class_weights)
     results = mutils.evaluate(
@@ -365,6 +379,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="output_suffix",
         default="",
         help="Optional suffix to append to saved model/prediction/metrics outputs",
+    )
+    tr.add_argument(
+        "--batch-log-path",
+        dest="batch_log_path",
+        default=None,
+        help="Optional CSV path for per-batch diagnostics (defaults inside --artifacts)",
     )
     tr.add_argument(
         "--taxonomy-cols",
