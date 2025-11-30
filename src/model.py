@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -257,12 +258,80 @@ class TrainConfig:
     progress_bar: bool = True
     log_batch_progress: bool = True
     log_every: int = 50
+    batch_log_path: Path | None = None
 
 
 @dataclass
 class TrainState:
     history: list[dict]
     class_weights: Optional[torch.Tensor]
+
+
+DEFAULT_BATCH_LOG_COLUMNS = [
+    "epoch",
+    "mode",
+    "batch",
+    "batch_size",
+    "loss",
+    "bce",
+    "align",
+    "tax",
+    "skipped_nonfinite",
+    "taxonomy_input_nan_frac",
+    "taxonomy_input_neg_frac",
+    "z_seq_mean_norm",
+    "z_seq_max_norm",
+    "z_seq_nonfinite_frac",
+    "z_amr_mean_norm",
+    "z_amr_max_norm",
+    "z_amr_nonfinite_frac",
+    "z_tax_leaf_mean_norm",
+    "z_tax_leaf_max_norm",
+    "z_tax_leaf_nonfinite_frac",
+    "z_tax_lineage_mean_norm",
+    "z_tax_lineage_max_norm",
+    "z_tax_lineage_nonfinite_frac",
+]
+
+
+class BatchCSVLogger:
+    """Append per-batch training/eval diagnostics to a CSV file."""
+
+    def __init__(self, path: Path, fieldnames: list[str] | None = None):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fieldnames = fieldnames or DEFAULT_BATCH_LOG_COLUMNS
+        if not self.path.exists():
+            with self.path.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writeheader()
+
+    def log(self, record: dict):
+        row = {k: record.get(k, "") for k in self.fieldnames}
+        with self.path.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(row)
+
+
+def _embedding_norm_stats(t: torch.Tensor | None) -> tuple[float, float, float]:
+    """Return mean/max norm and fraction of non-finite entries."""
+
+    if t is None or t.numel() == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    flat = t.reshape(-1, t.shape[-1])
+    norms = flat.norm(dim=-1)
+    finite = torch.isfinite(norms)
+    if finite.any():
+        finite_norms = norms[finite]
+        mean_norm = finite_norms.mean().item()
+        max_norm = finite_norms.max().item()
+    else:
+        mean_norm = float("nan")
+        max_norm = float("nan")
+
+    nonfinite_frac = 1.0 - finite.float().mean().item()
+    return mean_norm, max_norm, nonfinite_frac
 
 
 def compute_class_weights(Y_train: np.ndarray) -> torch.Tensor:
@@ -282,10 +351,31 @@ def train_model(
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     history: list[dict] = []
+    batch_logger = BatchCSVLogger(cfg.batch_log_path) if cfg.batch_log_path is not None else None
 
     for ep in range(1, cfg.epochs + 1):
-        tr = _run_epoch(model, train_loader, opt, cfg, class_weights, train=True, device=device)
-        va = _run_epoch(model, val_loader, None, cfg, class_weights, train=False, device=device)
+        tr = _run_epoch(
+            model,
+            train_loader,
+            opt,
+            cfg,
+            class_weights,
+            train=True,
+            device=device,
+            epoch=ep,
+            batch_logger=batch_logger,
+        )
+        va = _run_epoch(
+            model,
+            val_loader,
+            None,
+            cfg,
+            class_weights,
+            train=False,
+            device=device,
+            epoch=ep,
+            batch_logger=batch_logger,
+        )
         rec = {"epoch": ep, "train": tr, "val": va}
         history.append(rec)
         print(
@@ -303,6 +393,8 @@ def _run_epoch(
     class_weights: Optional[torch.Tensor],
     train: bool,
     device: torch.device,
+    epoch: int,
+    batch_logger: BatchCSVLogger | None = None,
 ) -> dict:
     if train:
         model.train()
@@ -349,9 +441,48 @@ def _run_epoch(
                 loss_tax = stacked_entailment_radial(out["z_seq"], out["z_tax"], margin=0.05)
 
         loss = cfg.lambda_align * loss_align + cfg.lambda_bce * loss_bce + cfg.lambda_tax * loss_tax
+        bs = xb.size(0)
+
+        seq_mean, seq_max, seq_nonfinite = _embedding_norm_stats(out.get("z_seq"))
+        amr_mean, amr_max, amr_nonfinite = _embedding_norm_stats(out.get("z_amr"))
+        leaf_mean, leaf_max, leaf_nonfinite = _embedding_norm_stats(out.get("z_tax_leaf"))
+        lineage_mean, lineage_max, lineage_nonfinite = _embedding_norm_stats(out.get("z_tax_lineage"))
+
+        tb_float = tb.to(torch.float32)
+        tax_nan_frac = torch.isnan(tb_float).float().mean().item()
+        tax_neg_frac = (tb < 0).float().mean().item()
+
+        record = {
+            "epoch": epoch,
+            "mode": mode,
+            "batch": batch_idx,
+            "batch_size": bs,
+            "loss": loss.item(),
+            "bce": loss_bce.item(),
+            "align": loss_align.item(),
+            "tax": loss_tax.item(),
+            "skipped_nonfinite": False,
+            "taxonomy_input_nan_frac": tax_nan_frac,
+            "taxonomy_input_neg_frac": tax_neg_frac,
+            "z_seq_mean_norm": seq_mean,
+            "z_seq_max_norm": seq_max,
+            "z_seq_nonfinite_frac": seq_nonfinite,
+            "z_amr_mean_norm": amr_mean,
+            "z_amr_max_norm": amr_max,
+            "z_amr_nonfinite_frac": amr_nonfinite,
+            "z_tax_leaf_mean_norm": leaf_mean,
+            "z_tax_leaf_max_norm": leaf_max,
+            "z_tax_leaf_nonfinite_frac": leaf_nonfinite,
+            "z_tax_lineage_mean_norm": lineage_mean,
+            "z_tax_lineage_max_norm": lineage_max,
+            "z_tax_lineage_nonfinite_frac": lineage_nonfinite,
+        }
 
         if not torch.isfinite(loss) or not torch.isfinite(loss_align) or not torch.isfinite(loss_bce) or not torch.isfinite(loss_tax):
             logging.warning("Skipping batch %d due to non-finite loss components", batch_idx)
+            record["skipped_nonfinite"] = True
+            if batch_logger is not None:
+                batch_logger.log(record)
             continue
 
         if train:
@@ -359,12 +490,14 @@ def _run_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
 
-        bs = xb.size(0)
         n_obs += bs
         total_loss += loss.item() * bs
         total_bce += loss_bce.item() * bs
         total_align += loss_align.item() * bs
         total_tax += loss_tax.item() * bs
+
+        if batch_logger is not None:
+            batch_logger.log(record)
 
         if progress_bar is not None:
             progress_bar.set_postfix(
