@@ -274,10 +274,45 @@ def subsample_fasta_and_tsv(
 
 # --------------------------- Label preparation --------------------------
 
+def _split_classes(amr_class: str, atomic: bool) -> list[str]:
+    cleaned = clean_class(amr_class)
+    if not cleaned:
+        return []
+    if not atomic:
+        return [cleaned]
+    parts = [p.strip() for p in cleaned.split("/") if p.strip()]
+    # Preserve input order while deduplicating.
+    return list(dict.fromkeys(parts))
+
+
+def _save_class_list(classes_path: Path, class_list: Sequence[str], atomic: bool) -> None:
+    payload = {
+        "class_list": list(class_list),
+        "atomic": atomic,
+        "label_mode": "atomic" if atomic else "compound",
+    }
+    with open(classes_path, "w") as jf:
+        json.dump(payload, jf, indent=2)
+
+
+def load_class_list(classes_path: Path) -> tuple[list[str], bool]:
+    """Load the AMR class list along with its mode (atomic vs. compound)."""
+
+    with open(classes_path) as f:
+        payload = json.load(f)
+
+    class_list = payload.get("class_list", [])
+    label_mode = payload.get("label_mode", "compound")
+    atomic = bool(payload.get("atomic", label_mode == "atomic"))
+    return class_list, atomic
+
+
 def build_amr_labels(
     tsv_paths: Sequence[Path],
     fasta_paths: Sequence[Path],
     output_dir: Path,
+    *,
+    atomic: bool = False,
 ) -> AmrArtifacts:
     """Create contig-level AMR labels and save parquet/JSON artifacts."""
 
@@ -287,15 +322,15 @@ def build_amr_labels(
         sdf["source_file"] = Path(tsv).stem.replace(".amrfinder", "")
         hits.append(sdf)
     amr_hits = pd.concat(hits, ignore_index=True)
-    amr_hits["class"] = amr_hits["class"].map(clean_class)
+    amr_hits["class"] = amr_hits["class"].map(lambda c: _split_classes(c, atomic))
 
-    all_classes = sorted([c for c in amr_hits["class"].unique() if c])
+    all_classes = sorted({c for classes in amr_hits["class"] for c in classes})
     class_to_idx = {c: i for i, c in enumerate(all_classes)}
 
     labels = (
-        amr_hits[amr_hits["class"] != ""]
+        amr_hits[amr_hits["class"].map(bool)]
         .groupby(["source_file", "contig_id"])["class"]
-        .apply(lambda xs: sorted(set(xs)))
+        .apply(lambda xs: sorted({c for clist in xs for c in clist}))
         .reset_index()
     )
 
@@ -329,8 +364,7 @@ def build_amr_labels(
     labels_path = output_dir / "contig_amr_labels.parquet"
     classes_path = output_dir / "amr_class_list.json"
     combined.to_parquet(labels_path, index=False)
-    with open(classes_path, "w") as jf:
-        json.dump({"class_list": all_classes}, jf, indent=2)
+    _save_class_list(classes_path, all_classes, atomic)
 
     return AmrArtifacts(labels_path=labels_path, classes_path=classes_path)
 

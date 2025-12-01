@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -139,10 +138,9 @@ def cmd_prepare(args: argparse.Namespace):
     taxonomy_map = Path(args.taxonomy_map) if args.taxonomy_map else None
     lineage_path = Path(args.taxonomy_lineages) if args.taxonomy_lineages else None
 
-    artifacts = dutils.build_amr_labels(tsvs, fastas, out_dir)
+    artifacts = dutils.build_amr_labels(tsvs, fastas, out_dir, atomic=args.atomic)
     df = pd.read_parquet(artifacts.labels_path)
-    with open(artifacts.classes_path) as f:
-        class_list = json.load(f)["class_list"]
+    class_list, _ = dutils.load_class_list(artifacts.classes_path)
     if taxonomy_map is not None:
         df = dutils.attach_taxonomy(df, taxonomy_map, lineage_path)
     df = dutils.attach_sequences(df, fastas)
@@ -169,8 +167,13 @@ def cmd_train(args: argparse.Namespace):
     )
 
     df = pd.read_parquet(labels_path)
-    with open(classes_path) as f:
-        class_list = json.load(f)["class_list"]
+    class_list, class_list_is_atomic = dutils.load_class_list(classes_path)
+    if bool(args.atomic) != bool(class_list_is_atomic):
+        mode = "atomic" if class_list_is_atomic else "compound"
+        raise ValueError(
+            f"AMR class list was built in {mode} mode; rerun prepare with --atomic={class_list_is_atomic} "
+            "or pass a matching flag to --atomic"
+        )
 
     cfg = dutils.HashingConfig(k=args.k, buckets=args.buckets, stride=args.stride, max_len=args.max_len)
     df = dutils.attach_sequences(df, _path_list(args.fastas))
@@ -288,8 +291,13 @@ def cmd_balance(args: argparse.Namespace):
     classes_path = artifacts_dir / "amr_class_list.json"
 
     df = pd.read_parquet(labels_path)
-    with open(classes_path) as f:
-        class_list = json.load(f)["class_list"]
+    class_list, class_list_is_atomic = dutils.load_class_list(classes_path)
+    if bool(args.atomic) != bool(class_list_is_atomic):
+        mode = "atomic" if class_list_is_atomic else "compound"
+        raise ValueError(
+            f"AMR class list was built in {mode} mode; rerun prepare with --atomic={class_list_is_atomic} "
+            "or pass a matching flag to --atomic"
+        )
 
     fastas = _path_list(args.fastas)
     if not fastas:
@@ -329,8 +337,7 @@ def cmd_balance(args: argparse.Namespace):
 def cmd_plot(args: argparse.Namespace):
     artifacts_dir = Path(args.artifacts)
     preds = np.load(artifacts_dir / "predictions.npz")
-    with open(artifacts_dir / "amr_class_list.json") as f:
-        class_list = json.load(f)["class_list"]
+    class_list, _ = dutils.load_class_list(artifacts_dir / "amr_class_list.json")
 
     logits = preds["logits"]
     targets = preds["targets"]
@@ -429,6 +436,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional TSV with taxid and lineage ranks (domain,phylum,class,order,family,genus,species)",
     )
+    prep.add_argument(
+        "--atomic",
+        action="store_true",
+        help="Split multi-class AMRFinder labels into atomic classes (e.g., 'A/B' -> 'A', 'B')",
+    )
     prep.set_defaults(func=cmd_prepare)
 
     tr = sub.add_parser("train", help="Hash sequences and train the hyperbolic AMR model")
@@ -487,6 +499,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["f1", "average_precision"],
         help="Objective to optimize during threshold search",
     )
+    tr.add_argument(
+        "--atomic",
+        action="store_true",
+        help="Expect artifacts built with atomic AMR classes; errors if mismatched",
+    )
     tr.set_defaults(func=cmd_train)
 
     bal = sub.add_parser(
@@ -499,6 +516,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         nargs="+",
         help="FASTA paths (comma or space separated; globbing supported)",
+    )
+    bal.add_argument(
+        "--atomic",
+        action="store_true",
+        help="Expect artifacts built with atomic AMR classes; errors if mismatched",
     )
     bal.set_defaults(func=cmd_balance)
 
