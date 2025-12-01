@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -20,16 +21,27 @@ def _json_list(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
-def _path_list(value: str) -> list[Path]:
+def _path_list(values: str | Sequence[str]) -> list[Path]:
+    """Return a flattened list of paths from comma or space-delimited inputs.
+
+    The CLI supports both comma-delimited strings (original behavior) and
+    repeated/space-separated arguments (e.g., ``--tsvs a.tsv b.tsv``) while still
+    allowing shell glob expansion.
+    """
+
+    raw_values = [values] if isinstance(values, str) else list(values)
     paths: list[Path] = []
-    for raw in _json_list(value):
-        if glob.has_magic(raw):
-            matches = sorted(Path(p) for p in glob.glob(raw))
-            if not matches:
-                raise ValueError(f"No files matched pattern: {raw}")
-            paths.extend(matches)
-        else:
-            paths.append(Path(raw))
+
+    for raw in raw_values:
+        for entry in _json_list(raw):
+            if glob.has_magic(entry):
+                matches = sorted(Path(p) for p in glob.glob(entry))
+                if not matches:
+                    raise ValueError(f"No files matched pattern: {entry}")
+                paths.extend(matches)
+            else:
+                paths.append(Path(entry))
+
     return paths
 
 
@@ -354,8 +366,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub_sample = sub.add_parser(
         "subsample", help="Subsample FASTA/TSV pairs without rerunning AMRFinder"
     )
-    sub_sample.add_argument("--tsvs", required=True, help="Comma-delimited AMRFinder TSV paths")
-    sub_sample.add_argument("--fastas", required=True, help="Comma-delimited FASTA paths")
+    sub_sample.add_argument(
+        "--tsvs",
+        required=True,
+        nargs="+",
+        help="AMRFinder TSV paths (comma or space separated; globbing supported)",
+    )
+    sub_sample.add_argument(
+        "--fastas",
+        required=True,
+        nargs="+",
+        help="FASTA paths (comma or space separated; globbing supported)",
+    )
     sub_sample.add_argument("--output", required=True, help="Output directory for subsampled files")
     sub_sample.add_argument(
         "--frac",
@@ -384,8 +406,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub_sample.set_defaults(func=cmd_subsample)
 
     prep = sub.add_parser("prepare", help="Build contig labels and attach sequences")
-    prep.add_argument("--tsvs", required=True, help="Comma-delimited AMRFinder TSV paths")
-    prep.add_argument("--fastas", required=True, help="Comma-delimited FASTA paths")
+    prep.add_argument(
+        "--tsvs",
+        required=True,
+        nargs="+",
+        help="AMRFinder TSV paths (comma or space separated; globbing supported)",
+    )
+    prep.add_argument(
+        "--fastas",
+        required=True,
+        nargs="+",
+        help="FASTA paths (comma or space separated; globbing supported)",
+    )
     prep.add_argument("--output", required=True, help="Artifact output directory")
     prep.add_argument(
         "--taxonomy-map",
@@ -401,7 +433,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     tr = sub.add_parser("train", help="Hash sequences and train the hyperbolic AMR model")
     tr.add_argument("--artifacts", required=True, help="Directory with contig_amr_labels.parquet/amr_class_list.json")
-    tr.add_argument("--fastas", required=True, help="Comma-delimited FASTA paths for sequences")
+    tr.add_argument(
+        "--fastas",
+        required=True,
+        nargs="+",
+        help="FASTA paths for sequences (comma or space separated; globbing supported)",
+    )
     tr.add_argument("--k", type=int, default=5)
     tr.add_argument("--buckets", type=int, default=4096)
     tr.add_argument("--stride", type=int, default=1)
@@ -460,7 +497,8 @@ def build_parser() -> argparse.ArgumentParser:
     bal.add_argument(
         "--fastas",
         required=True,
-        help="Comma-delimited FASTA paths (used to recover missing source_file entries)",
+        nargs="+",
+        help="FASTA paths (comma or space separated; globbing supported)",
     )
     bal.set_defaults(func=cmd_balance)
 
