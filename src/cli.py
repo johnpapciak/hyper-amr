@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 from pathlib import Path
 
@@ -17,6 +18,50 @@ from . import plotting
 
 def _json_list(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _path_list(value: str) -> list[Path]:
+    paths: list[Path] = []
+    for raw in _json_list(value):
+        if glob.has_magic(raw):
+            matches = sorted(Path(p) for p in glob.glob(raw))
+            if not matches:
+                raise ValueError(f"No files matched pattern: {raw}")
+            paths.extend(matches)
+        else:
+            paths.append(Path(raw))
+    return paths
+
+
+def _align_by_stem(tsvs: list[Path], fastas: list[Path]) -> tuple[list[Path], list[Path]]:
+    tsv_by_stem: dict[str, Path] = {}
+    for t in tsvs:
+        stem = Path(t).stem.replace(".amrfinder", "")
+        if stem in tsv_by_stem:
+            raise ValueError(f"Duplicate TSV stem detected: {stem}")
+        tsv_by_stem[stem] = t
+
+    fasta_by_stem: dict[str, Path] = {}
+    for f in fastas:
+        stem = Path(f).stem
+        if stem in fasta_by_stem:
+            raise ValueError(f"Duplicate FASTA stem detected: {stem}")
+        fasta_by_stem[stem] = f
+
+    tsv_stems = set(tsv_by_stem)
+    fasta_stems = set(fasta_by_stem)
+    if tsv_stems != fasta_stems:
+        missing_fastas = sorted(tsv_stems - fasta_stems)
+        missing_tsvs = sorted(fasta_stems - tsv_stems)
+        msg_parts = []
+        if missing_fastas:
+            msg_parts.append("Missing FASTAs for: " + ", ".join(missing_fastas))
+        if missing_tsvs:
+            msg_parts.append("Missing TSVs for: " + ", ".join(missing_tsvs))
+        raise ValueError(" | ".join(msg_parts))
+
+    ordered_stems = sorted(tsv_stems)
+    return [tsv_by_stem[s] for s in ordered_stems], [fasta_by_stem[s] for s in ordered_stems]
 
 
 def cmd_download(args: argparse.Namespace):
@@ -44,8 +89,8 @@ def cmd_run_amrfinder(args: argparse.Namespace):
 
 
 def cmd_subsample(args: argparse.Namespace):
-    tsvs = [Path(p) for p in _json_list(args.tsvs)]
-    fastas = [Path(p) for p in _json_list(args.fastas)]
+    tsvs = _path_list(args.tsvs)
+    fastas = _path_list(args.fastas)
     if not tsvs or not fastas:
         raise ValueError("Provide at least one TSV and FASTA to subsample")
 
@@ -77,8 +122,7 @@ def cmd_subsample(args: argparse.Namespace):
 
 
 def cmd_prepare(args: argparse.Namespace):
-    tsvs = [Path(p) for p in _json_list(args.tsvs)]
-    fastas = [Path(p) for p in _json_list(args.fastas)]
+    tsvs, fastas = _align_by_stem(_path_list(args.tsvs), _path_list(args.fastas))
     out_dir = Path(args.output)
     taxonomy_map = Path(args.taxonomy_map) if args.taxonomy_map else None
     lineage_path = Path(args.taxonomy_lineages) if args.taxonomy_lineages else None
@@ -117,7 +161,7 @@ def cmd_train(args: argparse.Namespace):
         class_list = json.load(f)["class_list"]
 
     cfg = dutils.HashingConfig(k=args.k, buckets=args.buckets, stride=args.stride, max_len=args.max_len)
-    df = dutils.attach_sequences(df, [Path(p) for p in _json_list(args.fastas)])
+    df = dutils.attach_sequences(df, _path_list(args.fastas))
     X_seq, Y_amr = dutils.prepare_features(df, class_list, cfg, threads=args.hash_threads)
 
     split = df["split"].values if "split" in df.columns else dutils.train_val_test_split(df)["split"].values
@@ -235,7 +279,7 @@ def cmd_balance(args: argparse.Namespace):
     with open(classes_path) as f:
         class_list = json.load(f)["class_list"]
 
-    fastas = [Path(p) for p in _json_list(args.fastas)]
+    fastas = _path_list(args.fastas)
     if not fastas:
         raise ValueError("Provide at least one FASTA path with --fastas")
 
