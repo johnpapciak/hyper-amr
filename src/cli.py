@@ -140,13 +140,23 @@ def cmd_prepare(args: argparse.Namespace):
 
     artifacts = dutils.build_amr_labels(tsvs, fastas, out_dir, atomic=args.atomic)
     df = pd.read_parquet(artifacts.labels_path)
-    class_list, _ = dutils.load_class_list(artifacts.classes_path)
+    class_list, class_list_is_atomic = dutils.load_class_list(artifacts.classes_path)
     if taxonomy_map is not None:
         df = dutils.attach_taxonomy(df, taxonomy_map, lineage_path)
     df = dutils.attach_sequences(df, fastas)
     df = dutils.sanitize_prepared_labels(df, class_list)
+    if args.min_class_positives is not None:
+        df, class_list, dropped = dutils.filter_classes_by_min_positives(
+            df, class_list, args.min_class_positives
+        )
+        if dropped:
+            print(
+                f"Dropped {len(dropped)} AMR classes below {args.min_class_positives} positives: "
+                + ", ".join(dropped)
+            )
     df = dutils.train_val_test_split(df)
     df.to_parquet(artifacts.labels_path, index=False)
+    dutils.save_class_list(artifacts.classes_path, class_list, class_list_is_atomic)
     print(f"Saved labels -> {artifacts.labels_path}")
     print(f"Saved classes -> {artifacts.classes_path}")
 
@@ -440,6 +450,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--atomic",
         action="store_true",
         help="Split multi-class AMRFinder labels into atomic classes (e.g., 'A/B' -> 'A', 'B')",
+    )
+    prep.add_argument(
+        "--min-class-positives",
+        dest="min_class_positives",
+        type=int,
+        default=None,
+        help=(
+            "Drop AMR classes with fewer than the given positive contigs and remove their positive rows "
+            "before saving artifacts"
+        ),
     )
     prep.set_defaults(func=cmd_prepare)
 
