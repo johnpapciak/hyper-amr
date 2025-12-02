@@ -91,7 +91,7 @@ python -m hyper_amr.cli run-amrfinder --fasta data/raw/genome.fasta --output dat
 python -m hyper_amr.cli subsample --tsvs data/amrfinder/genome.amrfinder.tsv --fastas data/raw/genome.fasta \
     --output data/subsampled --frac 0.1 --max-contigs 5000
 python -m hyper_amr.cli prepare --tsvs data/amrfinder/genome.amrfinder.tsv \
-    --fastas data/raw/genome.fasta --output data/artifacts
+    --fastas data/raw/genome.fasta --output data/artifacts --min-class-positives 5
 python -m hyper_amr.cli balance --artifacts data/artifacts --fastas data/raw/genome.fasta
 python -m hyper_amr.cli train --artifacts data/artifacts --fastas data/raw/genome.fasta \
     --epochs 5 --k 5 --buckets 4096 --class-weights --hash-threads 4 --loader-workers 4
@@ -108,7 +108,10 @@ Key steps align with the notebook:
   so oversized FASTAs are reduced more aggressively than smaller ones.
 
 - **prepare**: build contig-level AMR labels, attach sequences, and store
-  `contig_amr_labels.parquet` + `amr_class_list.json` artifacts.
+  `contig_amr_labels.parquet` + `amr_class_list.json` artifacts. Use
+  `--min-class-positives` to drop rare AMR classes (and their positive
+  contigs) before saving artifacts, ensuring only well-supported classes
+  remain in the dataset.
 - **balance**: inspect AMR class balance per source FASTA (saves
   `label_balance_by_source.csv`) to validate label coverage before training.
 - **train**: hash sequences into k-mer buckets, configure hyperbolic geometry

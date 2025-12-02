@@ -295,6 +295,12 @@ def _save_class_list(classes_path: Path, class_list: Sequence[str], atomic: bool
         json.dump(payload, jf, indent=2)
 
 
+def save_class_list(classes_path: Path, class_list: Sequence[str], atomic: bool) -> None:
+    """Persist the AMR class list along with its labeling mode."""
+
+    _save_class_list(classes_path, class_list, atomic)
+
+
 def load_class_list(classes_path: Path) -> tuple[list[str], bool]:
     """Load the AMR class list along with its mode (atomic vs. compound)."""
 
@@ -364,7 +370,7 @@ def build_amr_labels(
     labels_path = output_dir / "contig_amr_labels.parquet"
     classes_path = output_dir / "amr_class_list.json"
     combined.to_parquet(labels_path, index=False)
-    _save_class_list(classes_path, all_classes, atomic)
+    save_class_list(classes_path, all_classes, atomic)
 
     return AmrArtifacts(labels_path=labels_path, classes_path=classes_path)
 
@@ -585,6 +591,66 @@ def sanitize_prepared_labels(df: pd.DataFrame, class_list: Sequence[str]) -> pd.
             cleaned = cleaned.loc[~missing_seq].copy()
 
     return cleaned
+
+
+def filter_classes_by_min_positives(
+    df: pd.DataFrame, class_list: Sequence[str], min_positives: int
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Drop underrepresented AMR classes and their positive contigs.
+
+    Args:
+        df: Prepared labels containing a ``label_vector`` column.
+        class_list: The AMR class ordering for ``label_vector`` columns.
+        min_positives: Minimum positive contigs required to keep a class.
+
+    Returns:
+        A tuple of ``(filtered_df, kept_classes, dropped_classes)`` with label
+        vectors truncated to the kept classes. Rows that were positive for any
+        dropped class are removed entirely.
+    """
+
+    if min_positives is None:
+        return df.copy(), list(class_list), []
+    if min_positives <= 0:
+        raise ValueError("min_class_positives must be a positive integer")
+
+    class_arr = np.stack([
+        np.array(v if isinstance(v, (list, tuple, np.ndarray)) else json.loads(v), dtype=np.int64)
+        for v in df["label_vector"].values
+    ])
+
+    if class_arr.shape[1] != len(class_list):
+        raise ValueError("label_vector width does not match class_list length")
+
+    class_totals = class_arr.sum(axis=0)
+    keep_mask = class_totals >= min_positives
+    kept_classes = [c for c, keep in zip(class_list, keep_mask) if keep]
+    dropped_classes = [c for c, keep in zip(class_list, keep_mask) if not keep]
+
+    if not dropped_classes:
+        return df.copy(), kept_classes, dropped_classes
+
+    kept_rows = class_arr[:, ~keep_mask].sum(axis=1) == 0
+    filtered_df = df.loc[kept_rows].copy()
+    filtered_labels = class_arr[kept_rows][:, keep_mask]
+    filtered_df["label_vector"] = [v.astype(np.float32) for v in filtered_labels]
+
+    if "class" in filtered_df.columns:
+        allowed = set(kept_classes)
+        filtered_df["class"] = filtered_df["class"].apply(
+            lambda vals: [c for c in vals if c in allowed] if isinstance(vals, (list, tuple, set)) else vals
+        )
+
+    filtered_df["num_classes"] = filtered_df["label_vector"].apply(lambda v: int(np.sum(v)))
+    if "is_amr_positive" in filtered_df.columns:
+        filtered_df["is_amr_positive"] = filtered_df["num_classes"] > 0
+
+    if not kept_classes:
+        raise ValueError(
+            "All AMR classes were dropped by min_class_positives; lower the threshold or rebuild labels"
+        )
+
+    return filtered_df, kept_classes, dropped_classes
 
 
 def train_val_test_split(
