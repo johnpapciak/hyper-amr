@@ -137,6 +137,7 @@ def cmd_prepare(args: argparse.Namespace):
     out_dir = Path(args.output)
     taxonomy_map = Path(args.taxonomy_map) if args.taxonomy_map else None
     lineage_path = Path(args.taxonomy_lineages) if args.taxonomy_lineages else None
+    exclude_classes_path = Path(args.exclude_classes_tsv) if args.exclude_classes_tsv else None
 
     artifacts = dutils.build_amr_labels(tsvs, fastas, out_dir, atomic=args.atomic)
     df = pd.read_parquet(artifacts.labels_path)
@@ -145,6 +146,16 @@ def cmd_prepare(args: argparse.Namespace):
         df = dutils.attach_taxonomy(df, taxonomy_map, lineage_path)
     df = dutils.attach_sequences(df, fastas)
     df = dutils.sanitize_prepared_labels(df, class_list)
+    if exclude_classes_path is not None:
+        exclude_classes = pd.read_csv(
+            exclude_classes_path, sep="\t", header=None, names=["class"], dtype=str
+        )
+        excluded = [c.strip() for c in exclude_classes["class"].tolist() if isinstance(c, str)]
+        df, class_list, dropped = dutils.filter_classes_by_exclusion(df, class_list, excluded)
+        if dropped:
+            print(
+                f"Excluded {len(dropped)} AMR classes from provided list: " + ", ".join(dropped)
+            )
     if args.min_class_positives is not None:
         df, class_list, dropped = dutils.filter_classes_by_min_positives(
             df, class_list, args.min_class_positives
@@ -445,6 +456,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--taxonomy-lineages",
         default=None,
         help="Optional TSV with taxid and lineage ranks (domain,phylum,class,order,family,genus,species)",
+    )
+    prep.add_argument(
+        "--exclude-classes-tsv",
+        dest="exclude_classes_tsv",
+        default=None,
+        help="Optional TSV listing AMR classes to exclude (one class per line)",
     )
     prep.add_argument(
         "--atomic",

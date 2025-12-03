@@ -653,6 +653,64 @@ def filter_classes_by_min_positives(
     return filtered_df, kept_classes, dropped_classes
 
 
+def filter_classes_by_exclusion(
+    df: pd.DataFrame, class_list: Sequence[str], excluded_classes: Sequence[str]
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Drop specific AMR classes and any contigs positive for them.
+
+    Args:
+        df: Prepared labels containing a ``label_vector`` column.
+        class_list: The AMR class ordering for ``label_vector`` columns.
+        excluded_classes: Classes to remove entirely.
+
+    Returns:
+        A tuple of ``(filtered_df, kept_classes, dropped_classes)`` with label
+        vectors truncated to the kept classes. Rows that were positive for any
+        excluded class are removed entirely.
+    """
+
+    excluded_set = {c for c in excluded_classes if c}
+    if not excluded_set:
+        return df.copy(), list(class_list), []
+
+    unknown = excluded_set - set(class_list)
+    if unknown:
+        missing = ", ".join(sorted(unknown))
+        raise ValueError(f"Excluded classes not found in class list: {missing}")
+
+    class_arr = np.stack([
+        np.array(v if isinstance(v, (list, tuple, np.ndarray)) else json.loads(v), dtype=np.int64)
+        for v in df["label_vector"].values
+    ])
+
+    if class_arr.shape[1] != len(class_list):
+        raise ValueError("label_vector width does not match class_list length")
+
+    drop_mask = np.array([c in excluded_set for c in class_list], dtype=bool)
+    kept_classes = [c for c, drop in zip(class_list, drop_mask) if not drop]
+    dropped_classes = [c for c, drop in zip(class_list, drop_mask) if drop]
+
+    if not kept_classes:
+        raise ValueError("All AMR classes were excluded; remove fewer classes and retry")
+
+    kept_rows = class_arr[:, drop_mask].sum(axis=1) == 0
+    filtered_df = df.loc[kept_rows].copy()
+    filtered_labels = class_arr[kept_rows][:, ~drop_mask]
+    filtered_df["label_vector"] = [v.astype(np.float32) for v in filtered_labels]
+
+    if "class" in filtered_df.columns:
+        allowed = set(kept_classes)
+        filtered_df["class"] = filtered_df["class"].apply(
+            lambda vals: [c for c in vals if c in allowed] if isinstance(vals, (list, tuple, set)) else vals
+        )
+
+    filtered_df["num_classes"] = filtered_df["label_vector"].apply(lambda v: int(np.sum(v)))
+    if "is_amr_positive" in filtered_df.columns:
+        filtered_df["is_amr_positive"] = filtered_df["num_classes"] > 0
+
+    return filtered_df, kept_classes, dropped_classes
+
+
 def train_val_test_split(
     df: pd.DataFrame,
     train_frac: float = 0.7,
