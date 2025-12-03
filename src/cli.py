@@ -304,6 +304,105 @@ def cmd_train(args: argparse.Namespace):
     print(f"Saved model -> {torch_path}")
     print(f"Saved evaluation metrics -> {metrics_path}")
     print(f"Test macro AUPR={results.macro_aupr:.4f} | AUROC={results.macro_auroc:.4f}")
+
+
+def cmd_train_baseline(args: argparse.Namespace):
+    artifacts_dir = Path(args.artifacts)
+    labels_path = artifacts_dir / "contig_amr_labels.parquet"
+    classes_path = artifacts_dir / "amr_class_list.json"
+    output_suffix = args.output_suffix.strip()
+
+    def _with_suffix(path: Path) -> Path:
+        return path.with_name(f"{path.stem}_{output_suffix}{path.suffix}") if output_suffix else path
+
+    batch_log_path = (
+        Path(args.batch_log_path)
+        if args.batch_log_path
+        else _with_suffix(artifacts_dir / "baseline_batch_log.csv")
+    )
+
+    df = pd.read_parquet(labels_path)
+    class_list, class_list_is_atomic = dutils.load_class_list(classes_path)
+    if bool(args.atomic) != bool(class_list_is_atomic):
+        mode = "atomic" if class_list_is_atomic else "compound"
+        raise ValueError(
+            f"AMR class list was built in {mode} mode; rerun prepare with --atomic={class_list_is_atomic} "
+            "or pass a matching flag to --atomic"
+        )
+
+    cfg = dutils.HashingConfig(k=args.k, buckets=args.buckets, stride=args.stride, max_len=args.max_len)
+    df = dutils.attach_sequences(df, _path_list(args.fastas))
+    X_seq, Y_amr = dutils.prepare_features(df, class_list, cfg, threads=args.hash_threads)
+
+    split = df["split"].values if "split" in df.columns else dutils.train_val_test_split(df)["split"].values
+    train_loader, val_loader, test_loader = mutils.build_dataloaders(
+        X_seq, Y_amr, split, taxonomy=None, taxonomy_size=None, num_workers=args.loader_workers
+    )
+
+    mcfg = mutils.BaselineConfig(seq_dim=X_seq.shape[1], amr_classes=Y_amr.shape[1])
+    model = mutils.BaselineAMR(mcfg)
+
+    class_weights = mutils.compute_class_weights(Y_amr[split == "train"]) if args.class_weights else None
+    tcfg = mutils.BaselineTrainConfig(
+        epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        batch_log_path=batch_log_path,
+        progress_bar=not args.no_progress_bar,
+        log_batch_progress=not args.no_batch_logging,
+    )
+
+    state = mutils.train_baseline_model(
+        model, train_loader, val_loader, tcfg, class_weights=class_weights
+    )
+    results = mutils.evaluate(
+        model,
+        test_loader,
+        class_list,
+        calibrate_thresholds=args.calibrate_thresholds,
+        calibration_loader=val_loader if args.calibrate_thresholds else None,
+        calibration_metric=args.calibration_metric,
+    )
+
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    torch_path = _with_suffix(artifacts_dir / "baseline_model.pt")
+    torch.save({"model_state": model.state_dict(), "config": mcfg.__dict__}, torch_path)
+    np.savez(
+        _with_suffix(artifacts_dir / "baseline_predictions.npz"),
+        logits=results.logits,
+        targets=results.targets,
+        predictions=results.predictions,
+        thresholds=results.thresholds,
+    )
+    metrics_df = pd.DataFrame(
+        {
+            "amr_class": class_list,
+            "accuracy": results.accuracy_per_class,
+            "aupr": results.aupr_per_class,
+            "auroc": results.auroc_per_class,
+        }
+    )
+    metrics_df = pd.concat(
+        [
+            metrics_df,
+            pd.DataFrame(
+                [
+                    {
+                        "amr_class": "OVERALL",
+                        "accuracy": results.overall_accuracy,
+                        "aupr": results.macro_aupr,
+                        "auroc": results.macro_auroc,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    metrics_path = _with_suffix(artifacts_dir / "baseline_evaluation_metrics.csv")
+    metrics_df.to_csv(metrics_path, index=False)
+    print(f"Saved model -> {torch_path}")
+    print(f"Saved evaluation metrics -> {metrics_path}")
+    print(f"Test macro AUPR={results.macro_aupr:.4f} | AUROC={results.macro_auroc:.4f}")
  
 
 def cmd_balance(args: argparse.Namespace):
@@ -542,6 +641,87 @@ def build_parser() -> argparse.ArgumentParser:
         help="Expect artifacts built with atomic AMR classes; errors if mismatched",
     )
     tr.set_defaults(func=cmd_train)
+
+    trb = sub.add_parser(
+        "train-baseline", help="Train a Euclidean BCE baseline on hashed k-mer sequences"
+    )
+    trb.add_argument(
+        "--artifacts",
+        required=True,
+        help="Directory with contig_amr_labels.parquet/amr_class_list.json",
+    )
+    trb.add_argument(
+        "--fastas",
+        required=True,
+        nargs="+",
+        help="FASTA paths for sequences (comma or space separated; globbing supported)",
+    )
+    trb.add_argument("--k", type=int, default=5)
+    trb.add_argument("--buckets", type=int, default=4096)
+    trb.add_argument("--stride", type=int, default=1)
+    trb.add_argument("--max-len", dest="max_len", type=int, default=None)
+    trb.add_argument(
+        "--hash-threads",
+        dest="hash_threads",
+        type=int,
+        default=1,
+        help="Threads for k-mer hashing",
+    )
+    trb.add_argument(
+        "--loader-workers",
+        dest="loader_workers",
+        type=int,
+        default=0,
+        help="PyTorch DataLoader workers for training/eval",
+    )
+    trb.add_argument("--epochs", type=int, default=20)
+    trb.add_argument("--lr", type=float, default=1e-3)
+    trb.add_argument("--weight-decay", dest="weight_decay", type=float, default=1e-4)
+    trb.add_argument(
+        "--output-suffix",
+        dest="output_suffix",
+        default="baseline",
+        help="Optional suffix to append to saved model/prediction/metrics outputs",
+    )
+    trb.add_argument(
+        "--batch-log-path",
+        dest="batch_log_path",
+        default=None,
+        help="Optional CSV path for per-batch diagnostics (defaults inside --artifacts)",
+    )
+    trb.add_argument(
+        "--class-weights",
+        dest="class_weights",
+        action="store_true",
+        help="Use BCE positive weights",
+    )
+    trb.add_argument(
+        "--calibrate-thresholds",
+        action="store_true",
+        help="Search per-class decision thresholds on the validation set",
+    )
+    trb.add_argument(
+        "--calibration-metric",
+        default="f1",
+        choices=["f1", "average_precision"],
+        help="Objective to optimize during threshold search",
+    )
+    trb.add_argument(
+        "--no-progress-bar",
+        action="store_true",
+        help="Disable the tqdm progress bar during training/evaluation",
+    )
+    trb.add_argument(
+        "--no-batch-logging",
+        action="store_true",
+        help="Disable per-batch logging to stdout",
+    )
+    trb.add_argument(
+        "--atomic",
+        action="store_true",
+        help="Expect artifacts built with atomic AMR classes; errors if mismatched",
+    )
+    trb.set_defaults(func=cmd_train_baseline)
 
     bal = sub.add_parser(
         "balance",

@@ -114,6 +114,16 @@ class ModelConfig:
     taxonomy_levels: int = 1
 
 
+@dataclass
+class BaselineConfig:
+    """Configuration for the Euclidean baseline model."""
+
+    seq_dim: int
+    amr_classes: int
+    hidden: int = 512
+    embed_dim: int = 128
+
+
 class HyperAMR(nn.Module):
     """Lightweight hyperbolic AMR model suitable for CLI training."""
 
@@ -180,6 +190,35 @@ class HyperAMR(nn.Module):
             else:
                 raise ValueError(f"tax_idx must have dim 1 or 2, got {tax_idx.dim()}")
         return out
+
+
+class BaselineAMR(nn.Module):
+    """Euclidean baseline model that predicts AMR labels from sequence hashes."""
+
+    def __init__(self, cfg: BaselineConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.seq_encoder = nn.Sequential(
+            nn.Linear(cfg.seq_dim, cfg.hidden),
+            nn.ReLU(),
+            nn.Linear(cfg.hidden, cfg.embed_dim),
+            nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(cfg.embed_dim, cfg.hidden),
+            nn.ReLU(),
+            nn.Linear(cfg.hidden, cfg.amr_classes),
+        )
+
+    def forward(
+        self,
+        seq_feats: torch.Tensor,
+        amr_targets: torch.Tensor | None = None,
+        tax_idx: Optional[torch.Tensor] = None,  # pragma: no cover - ignored for baseline
+    ) -> Dict[str, torch.Tensor]:
+        z_seq = self.seq_encoder(seq_feats)
+        amr_logits = self.decoder(z_seq)
+        return {"z_seq": z_seq, "amr_logits": amr_logits}
 
 
 # ----------------------------- Train / Eval -----------------------------
@@ -255,6 +294,17 @@ class TrainConfig:
     lambda_align: float = 1.0
     lambda_bce: float = 1.0
     lambda_tax: float = 0.0
+    progress_bar: bool = True
+    log_batch_progress: bool = True
+    log_every: int = 50
+    batch_log_path: Path | None = None
+
+
+@dataclass
+class BaselineTrainConfig:
+    epochs: int = 20
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
     progress_bar: bool = True
     log_batch_progress: bool = True
     log_every: int = 50
@@ -340,6 +390,51 @@ def compute_class_weights(Y_train: np.ndarray) -> torch.Tensor:
     return torch.from_numpy((neg / pos).astype(np.float32))
 
 
+def train_baseline_model(
+    model: BaselineAMR,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: BaselineTrainConfig,
+    class_weights: Optional[torch.Tensor] = None,
+) -> TrainState:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    history: list[dict] = []
+    batch_logger = BatchCSVLogger(cfg.batch_log_path) if cfg.batch_log_path is not None else None
+
+    for ep in range(1, cfg.epochs + 1):
+        tr = _run_epoch_baseline(
+            model,
+            train_loader,
+            opt,
+            cfg,
+            class_weights,
+            train=True,
+            device=device,
+            epoch=ep,
+            batch_logger=batch_logger,
+        )
+        va = _run_epoch_baseline(
+            model,
+            val_loader,
+            None,
+            cfg,
+            class_weights,
+            train=False,
+            device=device,
+            epoch=ep,
+            batch_logger=batch_logger,
+        )
+        rec = {"epoch": ep, "train": tr, "val": va}
+        history.append(rec)
+        print(
+            f"[{ep:02d}] train loss={tr['loss']:.4f} bce={tr['bce']:.4f} | "
+            f"val loss={va['loss']:.4f} bce={va['bce']:.4f}"
+        )
+    return TrainState(history=history, class_weights=class_weights)
+
+
 def train_model(
     model: HyperAMR,
     train_loader: DataLoader,
@@ -383,6 +478,113 @@ def train_model(
             f"val loss={va['loss']:.4f} bce={va['bce']:.4f} align={va['align']:.4f}"
         )
     return TrainState(history=history, class_weights=class_weights)
+
+
+def _run_epoch_baseline(
+    model: BaselineAMR,
+    loader: DataLoader,
+    opt: Optional[torch.optim.Optimizer],
+    cfg: BaselineTrainConfig,
+    class_weights: Optional[torch.Tensor],
+    train: bool,
+    device: torch.device,
+    epoch: int,
+    batch_logger: BatchCSVLogger | None = None,
+) -> dict:
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = total_bce = 0.0
+    n_obs = 0
+    cw = class_weights.to(device) if class_weights is not None else None
+
+    progress_bar = None
+    iterator = loader
+    mode = "train" if train else "eval"
+    if cfg.progress_bar:
+        from tqdm import tqdm
+
+        progress_bar = tqdm(loader, desc=f"{mode} batches", leave=False)
+        iterator = progress_bar
+
+    for batch_idx, (xb, yb, _) in enumerate(iterator, start=1):
+        xb, yb = xb.to(device), yb.to(device)
+        if train:
+            opt.zero_grad()
+
+        out = model(xb, None)
+        loss_bce = bce_with_pos_weight(out["amr_logits"], yb, pos_weight=cw)
+        loss = loss_bce
+        bs = xb.size(0)
+
+        record = {
+            "epoch": epoch,
+            "mode": mode,
+            "batch": batch_idx,
+            "batch_size": bs,
+            "loss": loss.item(),
+            "bce": loss_bce.item(),
+            "align": 0.0,
+            "tax": 0.0,
+            "skipped_nonfinite": False,
+            "taxonomy_input_nan_frac": float("nan"),
+            "taxonomy_input_neg_frac": float("nan"),
+            "z_seq_mean_norm": float("nan"),
+            "z_seq_max_norm": float("nan"),
+            "z_seq_nonfinite_frac": float("nan"),
+            "z_amr_mean_norm": float("nan"),
+            "z_amr_max_norm": float("nan"),
+            "z_amr_nonfinite_frac": float("nan"),
+            "z_tax_leaf_mean_norm": float("nan"),
+            "z_tax_leaf_max_norm": float("nan"),
+            "z_tax_leaf_nonfinite_frac": float("nan"),
+            "z_tax_lineage_mean_norm": float("nan"),
+            "z_tax_lineage_max_norm": float("nan"),
+            "z_tax_lineage_nonfinite_frac": float("nan"),
+        }
+
+        if not torch.isfinite(loss):
+            logging.warning("Skipping batch %d due to non-finite loss", batch_idx)
+            record["skipped_nonfinite"] = True
+            if batch_logger is not None:
+                batch_logger.log(record)
+            continue
+
+        if train:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+
+        n_obs += bs
+        total_loss += loss.item() * bs
+        total_bce += loss_bce.item() * bs
+
+        if batch_logger is not None:
+            batch_logger.log(record)
+
+        if progress_bar is not None:
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}", bce=f"{loss_bce.item():.4f}")
+
+        if cfg.log_batch_progress and cfg.log_every > 0 and batch_idx % cfg.log_every == 0:
+            logging.info(
+                "%s batch %d/%d loss=%.4f bce=%.4f",
+                mode,
+                batch_idx,
+                len(loader),
+                loss.item(),
+                loss_bce.item(),
+            )
+
+    if progress_bar is not None:
+        progress_bar.close()
+
+    if n_obs == 0:
+        logging.warning("%s epoch produced no valid observations; returning NaN metrics", mode)
+        return {"loss": float("nan"), "bce": float("nan"), "align": float("nan"), "tax": float("nan")}
+
+    return {"loss": total_loss / n_obs, "bce": total_bce / n_obs, "align": 0.0, "tax": 0.0}
 
 
 def _run_epoch(
