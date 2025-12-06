@@ -618,10 +618,19 @@ def _run_epoch(
 
     for batch_idx, (xb, yb, tb) in enumerate(iterator, start=1):
         xb, yb, tb = xb.to(device), yb.to(device), tb.to(device)
+
+        # Replace any non-finite inputs with safe defaults to avoid NaNs propagating
+        xb = torch.nan_to_num(xb, nan=0.0, posinf=1.0, neginf=-1.0)
+        yb = torch.nan_to_num(yb, nan=0.0, posinf=0.0, neginf=0.0)
+        tb = torch.nan_to_num(tb, nan=-1.0, posinf=-1.0, neginf=-1.0).long()
         if train:
             opt.zero_grad()
 
         out = model(xb, yb, tax_idx=tb)
+        if not torch.isfinite(out["amr_logits"]).all() or not torch.isfinite(out["z_seq"]).all() or not torch.isfinite(out["z_amr"]).all():
+            logging.warning("Skipping batch %d due to non-finite model outputs", batch_idx)
+            continue
+
         loss_align = info_nce_hyper(out["z_seq"], out["z_amr"])
         loss_bce = bce_with_pos_weight(out["amr_logits"], yb, pos_weight=cw)
         loss_tax = torch.tensor(0.0, device=device)
@@ -759,13 +768,31 @@ def _collect_logits_and_targets(
     with torch.no_grad():
         for xb, yb, tb in loader:
             xb, yb = xb.to(device), yb.to(device)
-            out = model(xb, yb)
-            logits_all.append(out["amr_logits"].cpu().numpy())
-            targets_all.append(yb.cpu().numpy())
+            xb = torch.nan_to_num(xb, nan=0.0, posinf=1.0, neginf=-1.0)
+            yb = torch.nan_to_num(yb, nan=0.0, posinf=0.0, neginf=0.0)
 
-    logits = np.concatenate(logits_all, axis=0)
-    targets = np.concatenate(targets_all, axis=0)
-    return logits, targets
+            out = model(xb, yb)
+            logits = out["amr_logits"].detach().cpu().numpy()
+            targets = yb.cpu().numpy()
+
+            finite_mask = np.isfinite(logits).all(axis=1) & np.isfinite(targets).all(axis=1)
+            if not finite_mask.any():
+                logging.warning("Skipping batch with non-finite logits/targets during evaluation")
+                continue
+
+            logits_all.append(logits[finite_mask])
+            targets_all.append(targets[finite_mask])
+
+    if not logits_all:
+        logging.warning("No finite logits/targets collected; returning empty arrays")
+        return (
+            np.empty((0, model.cfg.amr_classes), dtype=np.float32),
+            np.empty((0, model.cfg.amr_classes), dtype=np.float32),
+        )
+
+    logits_concat = np.concatenate(logits_all, axis=0)
+    targets_concat = np.concatenate(targets_all, axis=0)
+    return logits_concat, targets_concat
 
 
 def _search_thresholds(
@@ -778,6 +805,10 @@ def _search_thresholds(
     from sklearn.metrics import average_precision_score, f1_score
 
     logits, targets = _collect_logits_and_targets(model, loader, device)
+    if logits.size == 0:
+        logging.warning("No finite logits available for threshold search; returning defaults")
+        return np.full(model.cfg.amr_classes, default, dtype=np.float32)
+
     probs = 1 / (1 + np.exp(-logits))
     C = targets.shape[1]
     thresholds = np.full(C, default, dtype=np.float32)
@@ -836,7 +867,25 @@ def evaluate(
             thresholds = np.full(len(class_list), 0.5, dtype=np.float32)
 
     logits, targets = _collect_logits_and_targets(model, loader, device)
+    if logits.size == 0:
+        logging.warning("No finite logits available for evaluation; returning NaN metrics")
+        empty = np.empty((0, len(class_list)), dtype=np.float32)
+        nan_array = [float("nan")] * len(class_list)
+        return EvalResults(
+            logits=empty,
+            targets=empty,
+            predictions=empty,
+            thresholds=np.full(len(class_list), 0.5, dtype=np.float32),
+            macro_aupr=float("nan"),
+            macro_auroc=float("nan"),
+            aupr_per_class=nan_array,
+            auroc_per_class=nan_array,
+            accuracy_per_class=nan_array,
+            overall_accuracy=float("nan"),
+        )
+
     probs = 1 / (1 + np.exp(-logits))
+    probs = np.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
     preds = (probs >= thresholds).astype(np.float32)
 
     aupr_per_class = []
